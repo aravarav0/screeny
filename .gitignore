@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+data/
+debug.log
+models/**/*.gguf
+*.gguf
+*.egg-info/
+dist/
+build/
+_research/

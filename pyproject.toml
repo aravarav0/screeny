@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "screeny"
+version = "0.1.0"
+description = "Local Windows desktop agent powered by Ollama"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx>=0.27.0",
+  "mss>=9.0.0",
+  "pillow>=10.0.0",
+  "pyautogui>=0.9.54",
+]
+
+[project.optional-dependencies]
+voice = [
+  "openai-whisper>=20240930",
+  "SpeechRecognition>=3.10.0",
+  "pyaudio>=0.2.14",
+  "pyttsx3>=2.90",
+  "edge-tts>=6.1.0",
+  "customtkinter>=5.2.0",
+  "soundfile>=0.12.1",
+]
+pointer = [
+  "rapidocr-onnxruntime>=1.4.0",
+  "uiautomation>=2.0.29",
+]
+
+[project.scripts]
+screeny = "screeny.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["screeny*"]

@@ -1,0 +1,6 @@
+FROM ./ui-tars-Q4_K_M.gguf
+FROM ./mmproj.gguf
+
+PARAMETER temperature 0
+PARAMETER num_ctx 4096
+PARAMETER stop "<|im_end|>"
