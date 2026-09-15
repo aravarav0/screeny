@@ -141,7 +141,7 @@ class ScreenyApp(ctk.CTk):
         self.pill = ctk.CTkFrame(
             self, corner_radius=Space.RADIUS_WINDOW, fg_color=Color.BG_1, border_width=0,
         )
-        self.pill.pack(fill="both", expand=True)
+        self.pill.pack(fill="both", expand=True, padx=0, pady=0)
 
         self.hero = HeroStatus(
             self.pill,
@@ -240,8 +240,9 @@ class ScreenyApp(ctk.CTk):
         import os
         if not os.environ.get("SCREENY_SHAPE_DEBUG"):
             return
-        from screeny.ui.win_shape import _client_size
-        w, h = _client_size(self)
+        from screeny.ui.win_shape import _hwnd_client_size, _outer_hwnd
+        hwnd = _outer_hwnd(self)
+        w, h = _hwnd_client_size(hwnd)
         print(f"[screeny shape] mode={getattr(self, '_shape_mode', '?')} client={w}x{h} "
               f"winfo={self.winfo_width()}x{self.winfo_height()} scale={self.tk.call('tk', 'scaling')}")
 

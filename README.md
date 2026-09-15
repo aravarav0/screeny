@@ -115,7 +115,7 @@ Copy `.env.example` to `.env` if you want to override defaults:
 
 - `VISION_MODEL` — default `qwen2.5vl:7b`
 - `PLANNER_MODEL` — default `llama3.2:3b`
-- `MAX_VISION_STEPS` — default `25`
+- `MAX_VISION_STEPS` — default `12`
 - `WHISPER_MODEL` — default `small`
 
 Installers go to `data/downloads/`. Debug screenshots go to `data/debug/` (gitignored).
@@ -135,6 +135,12 @@ screeny/
   ui/                  overlay widgets + theme
 ```
 
+Run the routing smoke tests (no GPU needed):
+
+```powershell
+python -m unittest tests.test_router
+```
+
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

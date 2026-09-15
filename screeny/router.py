@@ -295,7 +295,7 @@ def _vision_steps_for(command: str) -> int:
 
 def _unknown_message() -> str:
     return (
-        "I didn't quite get that. Try rephrasing, or say the app/site clearly — "
+        "I didn't quite get that. Try rephrasing, or say the app/site clearly - "
         "like 'open Discord', 'close Steam', or 'search for cheap flights'."
     )
 
