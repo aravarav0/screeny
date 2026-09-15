@@ -40,6 +40,9 @@ def route_command(
     if not text or len(text) < 2:
         return RouteOutcome("unknown", _unknown_message())
 
+    if social := _social_reply(text):
+        return RouteOutcome("tool", social)
+
     # Follow-ups that point at what's already on screen go straight to vision.
     if _is_screen_followup(text):
         return RouteOutcome(
@@ -295,6 +298,25 @@ def _unknown_message() -> str:
         "I didn't quite get that. Try rephrasing, or say the app/site clearly — "
         "like 'open Discord', 'close Steam', or 'search for cheap flights'."
     )
+
+
+_SOCIAL = re.compile(
+    r"^(?:thanks?|thank you|thx|hello|hi|hey|good morning|good night|"
+    r"you(?:'re| are) welcome|no problem|ok(?:ay)? thanks|appreciate it)[.!?\s]*$",
+    re.I,
+)
+
+
+def _social_reply(command: str) -> str | None:
+    text = command.strip()
+    if not text or not _SOCIAL.match(text):
+        return None
+    low = text.lower()
+    if re.search(r"\bthank", low):
+        return "You're welcome!"
+    if re.search(r"^(?:hi|hello|hey|good morning)", low):
+        return "Hi! What would you like me to do?"
+    return "Happy to help. What should I do next?"
 
 
 def _looks_like_task(command: str) -> bool:

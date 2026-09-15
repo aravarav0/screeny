@@ -27,7 +27,6 @@ def locate_with_grid(
     *,
     offset_x: int = 0,
     offset_y: int = 0,
-    *,
     single_stage: bool = False,
 ) -> tuple[int, int] | None:
     """Return native pixel center for `target`, or None.

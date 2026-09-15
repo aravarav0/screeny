@@ -76,27 +76,15 @@ PLANNER_SYSTEM = """You are Screeny, a smart local Windows assistant. Think like
 
 ALWAYS fill in "reasoning" and "phases" — show common sense about what the task really involves.
 
-Return JSON only:
+Return JSON only (valid JSON — one string per field, no line breaks inside strings):
 {
   "summary": "one short sentence for the user",
-  "reasoning": "2-4 sentences: what this task involves, pitfalls, what 'done' looks like. "
-               "For installs: official vendor site, .exe download, wait, run installer, "
-               "UAC may need user, wizard steps. Never use random third-party download sites.",
-  "phases": [
-    "phase 1 as a short string",
-    "phase 2 ...",
-    "at least 4-7 phases for installs/downloads/games"
-  ],
+  "reasoning": "2-4 sentences: pitfalls and what done looks like. For installs: official vendor site, exe download, run installer, wizard steps.",
+  "phases": ["Search", "Open vendor site", "Download", "Run installer", "Finish setup"],
   "steps": [
-    {"action": "open_url", "url": "https://..."},
-    {"action": "google_search", "query": "..."},
-    {"action": "launch_app", "app": "chrome"},
-    {"action": "close_app", "app": "steam"},
-    {"action": "install_app", "app": "spotify"},
+    {"action": "google_search", "query": "app name official download windows"},
     {"action": "wait", "seconds": 2},
-    {"action": "vision", "goal": "precise instruction for the NEXT screen work"},
-    {"action": "ask_user", "prompt": "what to ask", "secret": false},
-    {"action": "respond", "text": "direct answer"}
+    {"action": "vision", "goal": "Open the official result, click Download for Windows, run the installer, click through the setup wizard."}
   ]
 }
 
@@ -126,19 +114,23 @@ User request: "{command}"
 
 Produce the JSON plan now."""
 
-TEXT_ONLY_SYSTEM = """You control Windows via a numbered list of real UI elements (from accessibility).
-Return ONE next step as JSON only — no screenshot, trust the element list.
-
-Prefer {{"action":"click","label":N}} using the NUMBER from the list (e.g. label 3).
-You may also use the exact quoted element name as label if easier.
-On Google results: click the official vendor/download link — NEVER "About this result".
-Never click browser chrome: Extensions, tabs, toolbar buttons, bookmarks, or address bar.
-Never click Gemini, Copilot, ChatGPT, or unrelated browser promos.
-On vendor sites: click the large DOWNLOAD button in the page body (under "Download the Game").
-NEVER click Play Now in the top navigation bar — that opens sign-in, not the installer.
-On Windows-vs-Mac choosers, click Windows / PC.
-Other actions: wait (max 2s), done, fail, ask.
-If the right control is in the list, pick it by label — do NOT guess coordinates."""
+TEXT_ONLY_SYSTEM = """You select ONE UI element from a numbered candidate list to advance the task.
+Rules:
+- Respond ONLY with JSON containing an "action" field. Examples:
+  {{"action":"click","label":3,"thought":"..."}}
+  {{"action":"wait","seconds":1}}
+  {{"action":"done","reason":"..."}}
+  {{"action":"fail","reason":"..."}}
+  {{"action":"ask","question":"..."}}
+- "action" is REQUIRED. Omitting it is invalid — respond again with valid JSON only.
+- Pick ONLY from the provided numbered list for clicks. Never invent coordinates.
+- NEVER pick: browser tabs, extensions, bookmarks, sign-in, ads, "About this result".
+- Installing software = DOWNLOAD a file, then run the installer. Links named
+  "Play <X>", "Launch", "Open", "Sign in" are NEVER the install path.
+- If the previous result says a download started, the only valid action is "wait".
+- Header/navigation links are never the install path.
+- For downloads: prefer DOWNLOAD over PLAY NOW / SIGN IN. Prefer Windows over Mac.
+- When unsure, use {{"action":"wait","seconds":1}} — never omit the action field."""
 
 TEXT_ONLY_USER = """Goal: {goal}
 Step: {step}/{max_steps}

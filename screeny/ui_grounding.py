@@ -491,3 +491,140 @@ def _tokens(text: str) -> list[str]:
     import re
 
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+
+
+MAX_UIA_AREA_FRAC = 0.08
+_BROWSER_CHROME_INSET = 110
+
+
+def browser_viewport_rect(
+    screen_width: int, screen_height: int
+) -> tuple[int, int, int, int] | None:
+    """Web content area inside the foreground browser window (left, top, right, bottom)."""
+    try:
+        import uiautomation as auto
+    except Exception:
+        return None
+
+    try:
+        fg = auto.GetForegroundControl()
+        if fg is None:
+            return None
+        doc = fg.DocumentControl(searchDepth=16)
+        if doc.Exists(maxSearchSeconds=0.4):
+            r = doc.BoundingRectangle
+            if r and r.width() > 200 and r.height() > 200:
+                return (
+                    max(0, r.left),
+                    max(0, r.top),
+                    min(screen_width, r.right),
+                    min(screen_height, r.bottom),
+                )
+        wr = fg.BoundingRectangle
+        if wr and wr.width() > 200:
+            top = wr.top + _BROWSER_CHROME_INSET
+            return (
+                max(0, wr.left),
+                top,
+                min(screen_width, wr.right),
+                min(screen_height, wr.bottom),
+            )
+    except Exception:
+        return None
+    return None
+
+
+def page_signature() -> str:
+    """Cheap navigation fingerprint: browser Document control name."""
+    try:
+        import uiautomation as auto
+    except Exception:
+        return ""
+
+    try:
+        fg = auto.GetForegroundControl()
+        if fg is None:
+            return ""
+        doc = fg.DocumentControl(searchDepth=16)
+        if doc.Exists(maxSearchSeconds=0.3):
+            return (doc.Name or "")[:120]
+    except Exception:
+        pass
+    return ""
+
+
+def wait_for_page_settle(
+    prev_sig: str,
+    *,
+    timeout: float = 8.0,
+    stable_for: float = 0.8,
+) -> str:
+    """Block until the page signature differs from prev_sig AND holds steady."""
+    t0 = time.time()
+    last = page_signature()
+    last_t = time.time()
+    while time.time() - t0 < timeout:
+        cur = page_signature()
+        if cur != last:
+            last, last_t = cur, time.time()
+        elif cur and cur != prev_sig and time.time() - last_t >= stable_for:
+            return cur
+        time.sleep(0.25)
+    return last
+
+
+def viewport_as_ltrb(viewport: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    left, top, right, bottom = viewport
+    return left, top, right, bottom
+
+
+def in_viewport(
+    x: int,
+    y: int,
+    viewport: tuple[int, int, int, int],
+    *,
+    margin: int = 4,
+) -> bool:
+    left, top, right, bottom = viewport_as_ltrb(viewport)
+    return left + margin <= x <= right - margin and top + margin <= y <= bottom - margin
+
+
+def element_in_viewport(
+    el: UIElement, viewport: tuple[int, int, int, int]
+) -> bool:
+    left, top, right, bottom = viewport_as_ltrb(viewport)
+    cx, cy = el.cx, el.cy
+    return left <= cx <= right and top <= cy <= bottom
+
+
+def uia_element_area_ok(
+    el: UIElement, viewport: tuple[int, int, int, int]
+) -> bool:
+    left, top, right, bottom = viewport_as_ltrb(viewport)
+    vw = max(1, right - left)
+    vh = max(1, bottom - top)
+    area = el.width * el.height
+    return area <= MAX_UIA_AREA_FRAC * vw * vh
+
+
+def filter_elements_for_browser(
+    elements: list[UIElement],
+    viewport: tuple[int, int, int, int] | None,
+    *,
+    screen_width: int,
+    screen_height: int,
+) -> list[UIElement]:
+    """Drop browser chrome and oversized UIA containers before the LLM sees them."""
+    if viewport is None:
+        viewport = browser_viewport_rect(screen_width, screen_height)
+    if viewport is None:
+        return elements
+
+    kept: list[UIElement] = []
+    for el in elements:
+        if not element_in_viewport(el, viewport):
+            continue
+        if not uia_element_area_ok(el, viewport):
+            continue
+        kept.append(el)
+    return kept if kept else elements

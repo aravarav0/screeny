@@ -136,13 +136,44 @@ def _start_ollama_windows() -> bool:
 
 def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            raise OllamaError(f"Model did not return JSON: {text[:500]}")
-        return json.loads(match.group(0))
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text).strip()
+
+    candidates: list[str] = []
+    if text:
+        candidates.append(text)
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match and match.group(0) not in candidates:
+        candidates.append(match.group(0))
+
+    last_err: json.JSONDecodeError | None = None
+    for raw in candidates:
+        for candidate in (raw, _relax_json(raw)):
+            if not candidate:
+                continue
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_err = exc
+                continue
+
+    snippet = text[:500].replace("\n", " ")
+    if last_err is not None:
+        raise OllamaError(f"Model returned invalid JSON ({last_err}): {snippet}")
+    raise OllamaError(f"Model did not return JSON: {snippet}")
+
+
+def _relax_json(text: str) -> str:
+    """Best-effort fixes for common LLM JSON mistakes."""
+    if not text:
+        return text
+    out = text
+    out = re.sub(r",\s*([}\]])", r"\1", out)
+    out = re.sub(r"\bTrue\b", "true", out)
+    out = re.sub(r"\bFalse\b", "false", out)
+    out = re.sub(r"\bNone\b", "null", out)
+    return out
 
 
 def chat(

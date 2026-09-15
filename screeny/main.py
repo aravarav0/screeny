@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+import sys
+
+# DPI awareness MUST be set before Tk/CTk initializes or SetWindowRgn coords drift at 150%.
+if sys.platform == "win32":
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 import argparse
 
 from screeny.agent import handle_command

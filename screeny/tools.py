@@ -50,6 +50,33 @@ SMART_URLS: dict[str, tuple[str, str, str | None]] = {
     "netflix": ("https://www.netflix.com/", "Opened Netflix.", None),
     "twitter": ("https://x.com/", "Opened X.", None),
     "x.com": ("https://x.com/", "Opened X.", None),
+    "instagram": ("https://www.instagram.com/", "Opened Instagram.", None),
+    "insta": ("https://www.instagram.com/", "Opened Instagram.", None),
+    "facebook": ("https://www.facebook.com/", "Opened Facebook.", None),
+    "tiktok": ("https://www.tiktok.com/", "Opened TikTok.", None),
+    "linkedin": ("https://www.linkedin.com/", "Opened LinkedIn.", None),
+    "whatsapp": ("https://web.whatsapp.com/", "Opened WhatsApp Web.", None),
+}
+
+_BROWSER_IN = re.compile(
+    r"\b(?:on|in)\s+(?:(?:google\s+)?chrome|edge|firefox|(?:the\s+)?browser)\b",
+    re.I,
+)
+
+_SITE_ALIASES: dict[str, str] = {
+    "instagram": "https://www.instagram.com/",
+    "insta": "https://www.instagram.com/",
+    "facebook": "https://www.facebook.com/",
+    "fb": "https://www.facebook.com/",
+    "twitter": "https://x.com/",
+    "x": "https://x.com/",
+    "tiktok": "https://www.tiktok.com/",
+    "linkedin": "https://www.linkedin.com/",
+    "reddit": "https://www.reddit.com/",
+    "whatsapp": "https://web.whatsapp.com/",
+    "discord": "https://discord.com/app",
+    "gmail": "https://mail.google.com/",
+    "youtube": "https://www.youtube.com/",
 }
 
 
@@ -126,6 +153,80 @@ def _clean_close_target(raw: str) -> str:
     return target.strip().rstrip(".?!,")
 
 
+def _strip_browser_phrases(text: str) -> str:
+    out = _BROWSER_IN.sub("", text).strip()
+    out = re.sub(r"\s{2,}", " ", out)
+    return out.rstrip(".?!,")
+
+
+def _detect_browser_from_text(text: str) -> str:
+    m = re.search(
+        r"\b(?:on|in)\s+(?:(?:google\s+)?(chrome|edge|firefox)|(?:the\s+)?browser)\b",
+        text,
+        re.I,
+    )
+    if not m:
+        return "chrome"
+    browser = m.group(1).lower() if m.group(1) else "chrome"
+    return browser if browser in {"chrome", "edge", "firefox"} else "chrome"
+
+
+def _site_url(site_name: str) -> str | None:
+    key = normalize_app_name(site_name)
+    if key in _SITE_ALIASES:
+        return _SITE_ALIASES[key]
+    if key.endswith((".com", ".org", ".net", ".io", ".gg")):
+        return key if key.startswith("http") else f"https://{key}"
+    if "." not in key and " " not in key and len(key) >= 3:
+        return f"https://www.{key}.com/"
+    return None
+
+
+def _needs_web_followthrough(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(message|dm|text|send|chat|reply|post|sign in|log in|login|"
+            r"download|install|click|navigate|search)\b",
+            text,
+            re.I,
+        )
+    )
+
+
+def try_open_in_browser(command: str) -> ToolResult | None:
+    """Parse 'open instagram on chrome and message …' — not a Windows app search."""
+    text = command.strip().lower()
+    if not _BROWSER_IN.search(text):
+        return None
+    if not re.search(r"\b(?:open|launch|go to|visit)\b", text):
+        return None
+
+    browser = _detect_browser_from_text(text)
+    site_text = _strip_browser_phrases(text)
+    site_text = re.sub(r"^(?:open|launch|go to|visit)\s+(?:my |the )?", "", site_text, flags=re.I)
+    site_text = re.sub(r"\s+and\b.*", "", site_text).strip().rstrip(".")
+    if not site_text:
+        return None
+
+    url = _site_url(site_text)
+    if not url:
+        return None
+
+    launch_app(browser)
+    time.sleep(0.7)
+    webbrowser.open(url)
+    SESSION.note_url(url)
+    SESSION.note_app(browser)
+
+    label = site_text.split()[0] if site_text else "the site"
+    vision_goal = command.strip() if _needs_web_followthrough(text) else None
+    return ToolResult(
+        True,
+        f"Opened {label} in {browser}.",
+        vision_goal,
+    )
+
+
 def try_fast_tool(command: str) -> ToolResult | None:
     text = command.strip().lower()
     if not text:
@@ -135,6 +236,10 @@ def try_fast_tool(command: str) -> ToolResult | None:
     if smart:
         return smart
 
+    browser_open = try_open_in_browser(command)
+    if browser_open:
+        return browser_open
+
     open_match = re.search(
         r"\b(?:open|launch|start|run|go\s+to)\s+(?:my\s+|the\s+)?(.+?)"
         r"(?:\s+please|\s+for me|\s+and\b|\s+then\b|\.|$)",
@@ -143,7 +248,7 @@ def try_fast_tool(command: str) -> ToolResult | None:
     if not open_match:
         return None
 
-    target = open_match.group(1).strip().rstrip(".")
+    target = _strip_browser_phrases(open_match.group(1).strip().rstrip("."))
     if not target:
         return None
 
@@ -319,6 +424,16 @@ def _is_ui_control_command(text: str) -> bool:
 
 
 def _launch_app(name: str) -> ToolResult:
+    name = _strip_browser_phrases(name.strip())
+    if not name:
+        return ToolResult(False, "No app name given.")
+
+    url = _site_url(name)
+    if url:
+        webbrowser.open(url)
+        SESSION.note_url(url)
+        return ToolResult(True, f"Opened {name} in your browser.")
+
     key = normalize_app_name(name)
     aliases = APP_ALIASES.get(key, [key])
 

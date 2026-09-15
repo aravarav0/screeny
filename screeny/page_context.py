@@ -16,6 +16,20 @@ def last_url_is_google_search() -> bool:
     )
 
 
+def url_from_link_text(name: str) -> str | None:
+    """Pull a site URL out of a UIA link name like 'VALORANT https://playvalorant.com › en-us'."""
+    if not name:
+        return None
+    m = re.search(r"(https?://[^\s›]+)", name)
+    if m:
+        return m.group(1).rstrip("/")
+    m = re.search(r"\b([a-z0-9][-a-z0-9]*\.(?:com|gg|net|io|org)(?:/[^\s›]*)?)", name, re.I)
+    if m:
+        host = m.group(1)
+        return host if host.startswith("http") else f"https://{host}"
+    return None
+
+
 def looks_like_google_results(elements: list[UIElement]) -> bool:
     blob = element_blob(elements)
     if not blob:
@@ -73,6 +87,14 @@ def on_vendor_or_app_page(elements: list[UIElement]) -> bool:
     """True when we're past Google — on a real site or installer."""
     if looks_like_google_results(elements):
         return False
+    if not elements:
+        return not last_url_is_google_search()
+    blob = element_blob(elements)
     if last_url_is_google_search():
+        # SESSION.last_url is often still the Google SERP after clicking a result.
+        if re.search(r"playvalorant|riotgames|\.(com|gg|net|io)\b", blob, re.I):
+            return True
+        if "google" not in blob and len(elements) >= 6:
+            return True
         return False
     return True

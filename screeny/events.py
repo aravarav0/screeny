@@ -23,6 +23,9 @@ class AgentEvents:
     - on_thought(text): a reasoning step (planner or vision).
     - on_action(text): an action that was performed.
     - on_status(text): a short status note.
+    - on_substatus(text): one-line working headline (shown in the hero strip).
+    - on_task_done(ok): task finished successfully or not.
+    - on_connection(ok): Ollama reachability changed.
     - ask(prompt, secret=False) -> str | None: block and ask the user for
       input. Returns the user's answer, or None if unavailable/cancelled.
       When secret is True the UI should mask the input (passwords).
@@ -32,6 +35,10 @@ class AgentEvents:
     on_thought: Callable[[str], None] = _noop
     on_action: Callable[[str], None] = _noop
     on_status: Callable[[str], None] = _noop
+    on_substatus: Callable[[str], None] = _noop
+    on_task_done: Callable[[bool], None] = _noop
+    on_connection: Callable[[bool], None] = _noop
+    on_install_phase: Callable[[int, float], None] = _noop
     ask: Callable[..., str | None] = _noop_ask
 
 

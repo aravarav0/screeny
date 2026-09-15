@@ -46,6 +46,15 @@ class SessionMemory:
             self.last_url = url
             self.browser_open = True
 
+    def note_left_google_search(self, destination: str | None = None) -> None:
+        """Call after clicking through a Google result — stale search URL blocks vendor detection."""
+        with self._lock:
+            if destination:
+                self.last_url = destination
+            elif self.last_url and "google.com/search" in self.last_url.lower():
+                self.last_url = None
+            self.browser_open = True
+
     def note_intent(self, intent: str) -> None:
         with self._lock:
             self.last_intent = intent

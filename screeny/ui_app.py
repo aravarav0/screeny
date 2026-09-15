@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import queue
+import subprocess
 import threading
 import tkinter as tk
 from enum import Enum
+from pathlib import Path
 
 import customtkinter as ctk
 
 from screeny.agent import handle_command
 from screeny.events import AgentEvents
 from screeny.ollama_client import ensure_ollama_running
+from screeny.ui.components import (
+    CommandBar,
+    EmptyState,
+    HeroStatus,
+    SettingsDrawer,
+    TaskGroup,
+    TaskJourney,
+)
+from screeny.ui.theme import Color, Font, Space
+from screeny.ui.win_shape import enable_dpi_awareness, suspend_chroma_for_drag, sync_window_shape
 from screeny.voice import VoiceIO, voice_available, voice_install_hint
 
 
@@ -22,64 +34,51 @@ class AgentState(str, Enum):
     ASKING = "asking"
 
 
-STATE_META: dict[AgentState, tuple[str, str, str]] = {
-    AgentState.OFF: ("Screeny", "Tap to wake", "#636366"),
-    AgentState.IDLE: ("Ready", "Waiting", "#30d158"),
-    AgentState.LISTENING: ("Listening", "Speak now", "#64d2ff"),
-    AgentState.WORKING: ("Working", "On it", "#ffd60a"),
-    AgentState.SPEAKING: ("Speaking", "", "#bf5af2"),
-    AgentState.ASKING: ("Input", "Your answer", "#ff375f"),
+ORB_MAP = {
+    AgentState.OFF: "OFF",
+    AgentState.IDLE: "IDLE",
+    AgentState.LISTENING: "LISTENING",
+    AgentState.WORKING: "WORKING",
+    AgentState.SPEAKING: "SPEAKING",
+    AgentState.ASKING: "ASKING",
 }
 
-FEED_STYLE: dict[str, tuple[str, str]] = {
-    "you": ("You", "#64d2ff"),
-    "plan": ("Plan", "#ffd60a"),
-    "think": ("Think", "#bf5af2"),
-    "act": ("Do", "#98989d"),
-    "screeny": ("Screeny", "#30d158"),
-    "ask": ("Ask", "#ff375f"),
-    "error": ("Error", "#ff453a"),
+_HEADLINES = {
+    "OFF": ("Screeny", "Tap to wake"),
+    "IDLE": ("Screeny · Ready", "Say \u201cHey Screeny\u201d or type below"),
+    "LISTENING": ("Listening…", "Go ahead"),
+    "SPEAKING": ("Screeny", "Speaking"),
+    "ASKING": ("Screeny needs you", "Answer below to continue"),
 }
-
-# Window chroma key — areas with this exact color become fully transparent on
-# Windows. Must not appear anywhere in the visible UI.
-CHROMA = "#010101"
-PILL = "#1c1c1e"
-PILL_HOVER = "#2c2c2e"
-TEXT = "#ffffff"
-MUTED = "#8e8e93"
-DIVIDER = "#3a3a3c"
-INPUT_BG = "#2c2c2e"
 
 
 class ScreenyApp(ctk.CTk):
     WIDTH = 380
-    COLLAPSED_H = 48
-    EXPANDED_H = 432
+    COLLAPSED_H = 52
+    EXPANDED_H = 500
     TOP_MARGIN = 8
-    CORNER_R = 24
-    HOVER_COLLAPSE_MS = 400
-    MAX_FEED_ROWS = 60
+    AUTO_COLLAPSE_MS = 8000
+    MAX_TASK_GROUPS = 20
 
     def __init__(self) -> None:
         super().__init__()
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+        Font.init()
 
         self.title("Screeny")
         self.geometry(f"{self.WIDTH}x{self.COLLAPSED_H}")
         self.resizable(False, False)
         self.overrideredirect(True)
         self.attributes("-topmost", True)
-        self.configure(fg_color=CHROMA)
 
         self._voice = VoiceIO()
         self._active = False
         self._expanded = False
         self._animating = False
         self._pinned = False
-        self._leave_timer: str | None = None
+        self._collapse_timer: str | None = None
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._events: queue.Queue[tuple] = queue.Queue()
@@ -92,210 +91,186 @@ class ScreenyApp(ctk.CTk):
         self._pending_ask: tuple[dict, threading.Event] | None = None
         self._mic_muted = False
         self._state = AgentState.OFF
-        self._pulse_on = False
-        self._feed_rows: list[ctk.CTkBaseClass] = []
+        self._task_groups: list[TaskGroup] = []
+        self._group: TaskGroup | None = None
+        self._task_summary = ""
+        self._substatus = ""
+        self._last_command = ""
         self._drag_x = 0
         self._drag_y = 0
         self._dragging = False
+        self._drag_start: tuple[int, int] | None = None
         self._custom_position = False
         self._current_h = self.COLLAPSED_H
+        self._install_progress_visible = False
+        self._install_active = False
+        self._journey_state = (-1, 0.0)
+        self._settings_visible = False
+        self._ollama_connected = False
+        self._shape_mode = "none"
+        self._shape_timer: str | None = None
 
         self._agent_events = AgentEvents(
             on_plan=self._ev_plan,
             on_thought=self._ev_thought,
             on_action=self._ev_action,
             on_status=self._ev_status,
+            on_substatus=self._ev_substatus,
+            on_task_done=self._ev_task_done,
+            on_connection=self._ev_connection,
+            on_install_phase=self._ev_install_phase,
             ask=self._ev_ask,
         )
 
         self._ollama_ready = threading.Event()
         self._build_ui()
-        self._bind_hover()
-        self._apply_chroma_transparency()
+        self.bind("<Map>", lambda _e: self._sync_window_shape(), add="+")
+        self.bind("<Configure>", self._on_root_configure, add="+")
         self._place_top_center(self.COLLAPSED_H)
+        self.after(50, self._sync_window_shape)
+        if __debug__:
+            self.after(200, self._log_shape_debug)
         self.after(80, self._poll_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Escape>", self._on_escape)
+        self.bind("<Control-Shift-s>", lambda _e: self._toggle_expand())
+        self.bind("<Control-Shift-S>", lambda _e: self._toggle_expand())
 
     # ----------------------------------------------------------------- UI build
-    def _apply_chroma_transparency(self) -> None:
-        """Make the rectangular window corners invisible on Windows."""
-        try:
-            self.attributes("-transparentcolor", CHROMA)
-        except tk.TclError:
-            return
-        try:
-            if hasattr(self, "_canvas"):
-                self._canvas.configure(bg=CHROMA)
-        except tk.TclError:
-            pass
-
     def _build_ui(self) -> None:
-        # Outer pill — fully rounded capsule; children inset so nothing clips the corners
         self.pill = ctk.CTkFrame(
-            self, corner_radius=self.CORNER_R, fg_color=PILL, border_width=0,
+            self, corner_radius=Space.RADIUS_WINDOW, fg_color=Color.BG_1, border_width=0,
         )
-        self.pill.pack(fill="both", expand=True, padx=0, pady=0)
+        self.pill.pack(fill="both", expand=True)
 
-        # --- Notch header (always visible) ---
-        self.header = ctk.CTkFrame(self.pill, fg_color="transparent", height=44)
-        self.header.pack(fill="x", padx=12, pady=(8, 0))
-        self.header.pack_propagate(False)
-
-        left = ctk.CTkFrame(self.header, fg_color="transparent")
-        left.pack(side="left", fill="y")
-
-        self.status_dot = ctk.CTkLabel(
-            left, text="●", width=12,
-            font=ctk.CTkFont(size=14), text_color="#636366",
+        self.hero = HeroStatus(
+            self.pill,
+            on_stop=self._stop_task,
+            on_pin=self._toggle_pin,
+            on_settings=self._toggle_settings,
+            on_toggle=self._toggle_power,
         )
-        self.status_dot.pack(side="left", padx=(0, 6))
+        self.hero.pack(fill="x")
 
-        titles = ctk.CTkFrame(left, fg_color="transparent")
-        titles.pack(side="left")
-
-        self.title_label = ctk.CTkLabel(
-            titles, text="Screeny", anchor="w",
-            font=ctk.CTkFont(size=13, weight="bold"), text_color=TEXT,
-        )
-        self.title_label.pack(anchor="w")
-
-        self.subtitle_label = ctk.CTkLabel(
-            titles, text="Tap to wake", anchor="w",
-            font=ctk.CTkFont(size=10), text_color=MUTED,
-        )
-        self.subtitle_label.pack(anchor="w")
-
-        # Waveform bars — centered in the notch when active
-        self.wave_frame = ctk.CTkFrame(self.header, fg_color="transparent")
-        self.wave_bars: list[ctk.CTkProgressBar] = []
-        bar_heights = (0.25, 0.45, 0.7, 0.95, 0.6, 0.85, 0.4)
-        for h in bar_heights:
-            bar = ctk.CTkProgressBar(
-                self.wave_frame, width=3, height=18, corner_radius=2,
-                orientation="vertical", progress_color="#64d2ff", fg_color="#3a3a3c",
-            )
-            bar.set(h * 0.15)
-            bar.pack(side="left", padx=2, pady=4)
-            self.wave_bars.append(bar)
-
-        right = ctk.CTkFrame(self.header, fg_color="transparent")
-        right.pack(side="right")
-
-        self.pin_btn = ctk.CTkButton(
-            right, text="📌", width=28, height=28, corner_radius=14,
-            font=ctk.CTkFont(size=12), fg_color="transparent",
-            hover_color=PILL_HOVER, text_color=MUTED,
-            command=self._toggle_pin,
-        )
-
-        self.mic_btn = ctk.CTkButton(
-            right, text="🎤", width=28, height=28, corner_radius=14,
-            font=ctk.CTkFont(size=13), fg_color="transparent",
-            hover_color=PILL_HOVER, text_color=MUTED,
-            command=self._on_mic_toggle,
-        )
-        self.mic_btn.pack(side="right", padx=(0, 2))
-
-        self.toggle = ctk.CTkSwitch(
-            right, text="", width=40, height=20,
-            command=self._on_toggle,
-            progress_color="#30d158", button_color="#ffffff",
-            button_hover_color="#e5e5ea", fg_color="#3a3a3c",
-        )
-        self.toggle.pack(side="right", padx=(0, 4))
-
-        # Tap title area to wake when off
-        for widget in (left, titles, self.title_label, self.subtitle_label, self.status_dot):
-            widget.bind("<Button-1>", self._on_wake_tap, add="+")
-
-        self.bind("<Escape>", self._on_escape)
-        self.header.bind("<Button-3>", self._show_context_menu)
-
-        # --- Expandable body (revealed on hover) ---
         self.body = ctk.CTkFrame(self.pill, fg_color="transparent")
 
-        self.divider = ctk.CTkFrame(self.body, height=1, fg_color=DIVIDER)
-        self.divider.pack(fill="x", padx=12, pady=(4, 4))
+        self.divider = ctk.CTkFrame(self.body, height=1, fg_color=Color.STROKE)
+
+        self.journey = TaskJourney(self.body)
 
         self.feed = ctk.CTkScrollableFrame(
-            self.body, fg_color=PILL, corner_radius=16, height=228,
-            scrollbar_button_color="#3a3a3c",
-            scrollbar_button_hover_color="#48484a",
+            self.body, fg_color="transparent",
+            scrollbar_button_color=Color.STROKE,
+            scrollbar_button_hover_color=Color.STROKE_HI,
         )
-        self.feed.pack(fill="both", expand=True, padx=8, pady=(0, 2))
-
-        self.feed_label = ctk.CTkLabel(
-            self.feed, text="Activity shows here",
-            font=ctk.CTkFont(size=11), text_color="#636366",
-        )
+        self.feed.bind("<Configure>", self._on_feed_resize)
+        self.feed._parent_canvas.bind("<Configure>", self._fit_feed, add="+")
+        self.empty = EmptyState(self.feed, on_example=self._submit_command)
+        self.empty.pack(fill="x")
 
         self.ask_panel = ctk.CTkFrame(
-            self.body, corner_radius=16, fg_color="#2c2c2e", border_width=0,
+            self.body, corner_radius=Space.RADIUS_CARD,
+            fg_color=Color.ASKING_BG, border_width=1, border_color=Color.ASKING,
         )
         self.ask_question = ctk.CTkLabel(
             self.ask_panel, text="", anchor="w", justify="left",
-            font=ctk.CTkFont(size=12, weight="bold"), text_color="#ff375f",
+            font=Font.TITLE, text_color=Color.ASKING,
             wraplength=self.WIDTH - 56,
         )
-        self.ask_question.pack(fill="x", padx=14, pady=(12, 6))
+        self.ask_question.pack(fill="x", padx=Space.M, pady=(Space.M, Space.S))
 
         ask_row = ctk.CTkFrame(self.ask_panel, fg_color="transparent")
-        ask_row.pack(fill="x", padx=14, pady=(0, 12))
+        ask_row.pack(fill="x", padx=Space.M, pady=(0, Space.M))
         self.ask_entry = ctk.CTkEntry(
             ask_row, placeholder_text="Your answer…", height=34,
-            font=ctk.CTkFont(size=12), fg_color=INPUT_BG, border_width=0,
+            font=Font.BODY, fg_color=Color.BG_2, border_width=0,
         )
-        self.ask_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.ask_entry.pack(side="left", fill="x", expand=True, padx=(0, Space.S))
         self.ask_entry.bind("<Return>", self._on_ask_submit)
         self.ask_send = ctk.CTkButton(
-            ask_row, text="Send", width=54, height=34, corner_radius=10,
-            fg_color="#ff375f", hover_color="#d63350", command=self._on_ask_submit,
+            ask_row, text="Send", width=54, height=34, corner_radius=8,
+            fg_color=Color.ASKING, hover_color="#D9A41F",
+            text_color=Color.BG_0, command=self._on_ask_submit,
         )
         self.ask_send.pack(side="left")
         self.ask_skip = ctk.CTkButton(
-            ask_row, text="Skip", width=44, height=34, corner_radius=10,
-            fg_color="#3a3a3c", hover_color="#48484a", command=self._on_ask_skip,
+            ask_row, text="Skip", width=44, height=34, corner_radius=8,
+            fg_color=Color.BG_3, hover_color=Color.STROKE_HI,
+            command=self._on_ask_skip,
         )
-        self.ask_skip.pack(side="left", padx=(6, 0))
+        self.ask_skip.pack(side="left", padx=(Space.S, 0))
 
-        footer = ctk.CTkFrame(self.body, fg_color="transparent")
-        footer.pack(fill="x", padx=12, pady=(2, 10))
-        self.input_row = footer
-
-        self.command_entry = ctk.CTkEntry(
-            footer, placeholder_text="Type a command…", height=38,
-            font=ctk.CTkFont(size=12), fg_color=INPUT_BG, border_width=0,
-            corner_radius=12,
+        self.settings = SettingsDrawer(
+            self.body,
+            info={
+                "vision_model": "qwen2.5vl:7b",
+                "planner_model": "llama3.2:3b",
+                "voice": "Whisper + TTS",
+            },
+            on_open_logs=self._open_logs,
+            on_mic_toggle=self._on_mic_toggle,
         )
-        self.command_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.command_entry.bind("<Return>", self._on_submit_text)
-        self.command_entry.bind("<FocusIn>", lambda _e: self._set_pinned(True))
-        self.command_entry.bind("<FocusOut>", lambda _e: self.after(200, self._schedule_hover_collapse))
 
-        self.send_button = ctk.CTkButton(
-            footer, text="↑", width=38, height=38, corner_radius=12,
-            font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color="#0a84ff", hover_color="#0070e0", command=self._on_submit_text,
+        self.cmdbar = CommandBar(self.body, on_submit=self._submit_command)
+        self.cmdbar.entry.bind("<FocusIn>", lambda _e: self._set_pinned(True))
+        self.cmdbar.entry.bind(
+            "<FocusOut>", lambda _e: self.after(200, self._schedule_auto_collapse),
         )
-        self.send_button.pack(side="right")
 
-        self.clear_button = ctk.CTkButton(
-            footer, text="Clear", width=44, height=24, corner_radius=8,
-            font=ctk.CTkFont(size=10), fg_color="transparent",
-            hover_color=PILL_HOVER, text_color=MUTED, command=self._clear_feed,
-        )
-        self.clear_button.pack(side="right", padx=(0, 6))
-
-        # Drag from the title strip only (not the whole window — that breaks chroma key)
-        self._drag_handle = ctk.CTkFrame(self.header, width=6, fg_color="transparent")
-        self._drag_handle.pack(side="left", fill="y", padx=(0, 4))
-        for widget in (self._drag_handle, left, titles, self.title_label, self.subtitle_label):
+        for widget in (
+            self.hero.headline, self.hero.substatus, self.hero.orb,
+            self.hero.conn.master if hasattr(self.hero.conn, "master") else self.hero,
+        ):
             widget.bind("<ButtonPress-1>", self._start_drag, add="+")
             widget.bind("<B1-Motion>", self._on_drag, add="+")
-            widget.bind("<ButtonRelease-1>", self._end_drag, add="+")
+            widget.bind("<ButtonRelease-1>", self._on_hero_release, add="+")
+
+        self.hero.bind("<Button-3>", self._show_context_menu)
+
+    def _sync_window_shape(self) -> None:
+        mode = sync_window_shape(
+            self,
+            chroma=Color.CHROMA,
+            radius_window=Space.RADIUS_WINDOW,
+            bg_panel=Color.BG_1,
+        )
+        self._shape_mode = mode
+
+    def _log_shape_debug(self) -> None:
+        import os
+        if not os.environ.get("SCREENY_SHAPE_DEBUG"):
+            return
+        from screeny.ui.win_shape import _client_size
+        w, h = _client_size(self)
+        print(f"[screeny shape] mode={getattr(self, '_shape_mode', '?')} client={w}x{h} "
+              f"winfo={self.winfo_width()}x{self.winfo_height()} scale={self.tk.call('tk', 'scaling')}")
+
+    def _on_root_configure(self, event: tk.Event | None = None) -> None:
+        if event is not None and event.widget is not self:
+            return
+        if self._shape_timer is not None:
+            self.after_cancel(self._shape_timer)
+        self._shape_timer = self.after(16, self._debounced_shape)
+
+    def _debounced_shape(self) -> None:
+        self._shape_timer = None
+        if not self._dragging:
+            self._sync_window_shape()
+
+    def _fit_feed(self, event=None) -> None:
+        try:
+            c = self.feed._parent_canvas
+            c.itemconfigure(self.feed._create_window, width=c.winfo_width())
+        except Exception:
+            pass
+
+    def _on_feed_resize(self, _event=None) -> None:
+        wrap = max(160, self.feed.winfo_width() - 36)
+        for group in self._task_groups:
+            group.set_wraplength(wrap)
 
     # ------------------------------------------------------------- positioning
-    def _place_geometry(self, height: int, *, refresh_chroma: bool = True) -> None:
+    def _place_geometry(self, height: int) -> None:
         self.update_idletasks()
         screen_w = self.winfo_screenwidth()
         if self._custom_position:
@@ -307,8 +282,7 @@ class ScreenyApp(ctk.CTk):
         self._current_h = height
         self.geometry(f"{self.WIDTH}x{height}+{x}+{y}")
         self.update_idletasks()
-        if refresh_chroma and not self._dragging:
-            self._apply_chroma_transparency()
+        self._sync_window_shape()
 
     def _place_top_center(self, height: int) -> None:
         self._place_geometry(height)
@@ -319,39 +293,39 @@ class ScreenyApp(ctk.CTk):
         self._drag_start = (event.x_root, event.y_root)
 
     def _on_drag(self, event: tk.Event) -> None:
-        if hasattr(self, "_drag_start"):
+        if self._drag_start:
             dx = abs(event.x_root - self._drag_start[0])
             dy = abs(event.y_root - self._drag_start[1])
             if dx + dy < 4:
                 return
         if not self._dragging:
-            self._begin_drag_mode()
+            self._dragging = True
+            suspend_chroma_for_drag(
+                self,
+                bg_panel=Color.BG_1,
+                radius_window=Space.RADIUS_WINDOW,
+            )
         x = event.x_root - self._drag_x
         y = max(0, event.y_root - self._drag_y)
         self._custom_position = True
-        self.geometry(f"{self.winfo_width()}x{self.winfo_height()}+{x}+{y}")
+        self.geometry(f"{self.WIDTH}x{self.winfo_height()}+{x}+{y}")
 
-    def _end_drag(self, _event: tk.Event | None = None) -> None:
+    def _on_hero_release(self, event: tk.Event | None = None) -> None:
         if self._dragging:
-            self._end_drag_mode()
-
-    def _begin_drag_mode(self) -> None:
-        self._dragging = True
-        if self._leave_timer is not None:
-            self.after_cancel(self._leave_timer)
-            self._leave_timer = None
-        # Chroma-key + motion corrupts CustomTkinter; use solid bg while dragging.
-        try:
-            self.attributes("-transparentcolor", "")
-        except tk.TclError:
-            pass
-        self.configure(fg_color=PILL)
-
-    def _end_drag_mode(self) -> None:
-        self._dragging = False
-        self.configure(fg_color=CHROMA)
-        self._apply_chroma_transparency()
-        self.update_idletasks()
+            self._dragging = False
+            self._drag_start = None
+            self._sync_window_shape()
+            return
+        if self._drag_start:
+            dx = abs((event.x_root if event else 0) - self._drag_start[0])
+            dy = abs((event.y_root if event else 0) - self._drag_start[1])
+            self._drag_start = None
+            if dx + dy >= 4:
+                return
+        if not self._active:
+            self._activate()
+        else:
+            self._toggle_expand()
 
     def _animate_height(self, target: int, *, on_done=None, step: int = 0, steps: int = 10) -> None:
         if step == 0:
@@ -364,18 +338,27 @@ class ScreenyApp(ctk.CTk):
                 on_done()
             return
         t = (step + 1) / steps
-        t = 1 - (1 - t) ** 3  # ease-out
+        t = 1 - (1 - t) ** 3
         h = max(self.COLLAPSED_H, int(start + (target - start) * t))
-        self._place_geometry(h, refresh_chroma=False)
+        self._place_geometry(h)
         self.after(14, lambda: self._animate_height(target, on_done=on_done, step=step + 1, steps=steps))
 
-    def _expand(self, *, animated: bool = True) -> None:
+    def _expand(self, *, animated: bool = True, auto: bool = False) -> None:
         if self._expanded:
             return
+        self._cancel_auto_collapse()
         self._expanded = True
-        self.body.pack(fill="both", expand=True, padx=4, pady=(0, 6), after=self.header)
-        self.pin_btn.pack(side="right", padx=(4, 0))
-        self._update_pin_btn()
+        self.body.pack(fill="both", expand=True, padx=Space.XS, pady=(0, Space.S), after=self.hero)
+        self.divider.pack(fill="x", padx=Space.M, pady=(Space.XS, Space.S))
+        if self._install_active and not self._install_progress_visible:
+            self.journey.pack(fill="x", padx=Space.S, pady=(0, Space.S), after=self.divider)
+            self._install_progress_visible = True
+            idx, frac = self._journey_state
+            if idx >= 0:
+                self.journey.set_phase(idx, frac)
+        self.feed.pack(fill="both", expand=True, padx=Space.S)
+        self.cmdbar.pack(fill="x", padx=Space.M, pady=(Space.S, Space.M))
+        self.hero.set_pinned(self._pinned)
         if animated:
             self._animate_height(self.EXPANDED_H)
         else:
@@ -390,8 +373,12 @@ class ScreenyApp(ctk.CTk):
         def finish() -> None:
             self.body.pack_forget()
             self.ask_panel.pack_forget()
+            if self._settings_visible:
+                self.settings.pack_forget()
+                self._settings_visible = False
             self._expanded = False
-            self.pin_btn.pack_forget()
+            self._install_progress_visible = False
+            self.journey.pack_forget()
 
         if animated:
             self._animate_height(self.COLLAPSED_H, on_done=finish)
@@ -399,76 +386,74 @@ class ScreenyApp(ctk.CTk):
             finish()
             self._place_top_center(self.COLLAPSED_H)
 
+    def _toggle_expand(self) -> None:
+        if self._expanded:
+            self._set_pinned(False)
+            self._collapse()
+        elif self._active:
+            self._expand(animated=True)
+
     def _toggle_pin(self) -> None:
         self._set_pinned(not self._pinned)
         if self._pinned and not self._expanded:
             self._expand(animated=True)
         elif not self._pinned:
-            self._schedule_hover_collapse()
+            self._schedule_auto_collapse()
 
     def _set_pinned(self, pinned: bool) -> None:
         self._pinned = pinned
-        self._update_pin_btn()
+        self.hero.set_pinned(pinned)
 
-    def _update_pin_btn(self) -> None:
-        if not self.pin_btn.winfo_ismapped():
-            return
-        if self._pinned:
-            self.pin_btn.configure(text="📍", text_color="#ffd60a")
-        else:
-            self.pin_btn.configure(text="📌", text_color=MUTED)
+    def _cancel_auto_collapse(self) -> None:
+        if self._collapse_timer is not None:
+            self.after_cancel(self._collapse_timer)
+            self._collapse_timer = None
 
-    def _bind_hover(self) -> None:
-        targets = (
-            self, self.pill, self.header, self.body, self.feed,
-            self.input_row, self.command_entry, self.send_button,
-        )
-        for widget in targets:
-            widget.bind("<Enter>", self._on_hover_enter, add="+")
-            widget.bind("<Leave>", self._on_hover_leave, add="+")
-
-    def _on_hover_enter(self, _event=None) -> None:
-        if self._dragging or self._animating:
-            return
-        if self._leave_timer is not None:
-            self.after_cancel(self._leave_timer)
-            self._leave_timer = None
-        if not self._expanded and not self._animating:
-            self._expand(animated=True)
-
-    def _on_hover_leave(self, _event=None) -> None:
-        self._schedule_hover_collapse()
-
-    def _schedule_hover_collapse(self) -> None:
+    def _schedule_auto_collapse(self) -> None:
         if self._pinned or self._pending_ask or self._awaiting_input.is_set():
-            return
-        if self._leave_timer is not None:
-            self.after_cancel(self._leave_timer)
-        self._leave_timer = self.after(self.HOVER_COLLAPSE_MS, self._try_hover_collapse)
-
-    def _try_hover_collapse(self) -> None:
-        self._leave_timer = None
-        if self._dragging or self._pinned or self._pending_ask or self._awaiting_input.is_set():
             return
         try:
             focused = self.focus_get()
-            if focused in {self.command_entry, self.ask_entry}:
+            if focused in {self.cmdbar.entry, self.ask_entry}:
                 return
         except (KeyError, tk.TclError):
             pass
-        if self._is_pointer_inside():
+        self._cancel_auto_collapse()
+        self._collapse_timer = self.after(self.AUTO_COLLAPSE_MS, self._try_auto_collapse)
+
+    def _try_auto_collapse(self) -> None:
+        self._collapse_timer = None
+        if self._pinned or self._pending_ask or self._awaiting_input.is_set():
             return
         self._collapse(animated=True)
 
-    def _is_pointer_inside(self) -> bool:
-        x, y = self.winfo_pointerx(), self.winfo_pointery()
-        rx, ry = self.winfo_rootx(), self.winfo_rooty()
-        return rx <= x <= rx + self.winfo_width() and ry <= y <= ry + self.winfo_height()
+    def _toggle_settings(self) -> None:
+        if self._settings_visible:
+            self.settings.pack_forget()
+            self._settings_visible = False
+            return
+        if not self._expanded:
+            self._expand(animated=True)
+        self.settings.pack(fill="x", padx=Space.M, pady=Space.S, before=self.cmdbar)
+        self.settings.set_connection(self._ollama_connected)
+        self._settings_visible = True
 
-    def _on_wake_tap(self, _event: tk.Event | None = None) -> None:
-        if not self._active and not self.toggle.get():
-            self.toggle.select()
+    def _toggle_power(self) -> None:
+        if self._active:
+            self._deactivate()
+        else:
             self._activate()
+
+    def _stop_task(self) -> None:
+        self._task_cancel.set()
+        if self._group:
+            self._group.add_card("act", "Stopped by you")
+            self._group.set_result(False)
+
+    def _open_logs(self) -> None:
+        log_dir = Path(__file__).resolve().parent.parent / "data" / "debug"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["explorer", str(log_dir)])
 
     def _on_escape(self, _event=None) -> None:
         if self._expanded:
@@ -476,53 +461,36 @@ class ScreenyApp(ctk.CTk):
             self._collapse()
 
     def _show_context_menu(self, event: tk.Event) -> None:
-        menu = tk.Menu(self, tearoff=0, bg=PILL, fg=TEXT, activebackground=PILL_HOVER)
+        menu = tk.Menu(self, tearoff=0, bg=Color.BG_2, fg=Color.TXT_PRIMARY,
+                       activebackground=Color.BG_3)
         if self._expanded:
-            menu.add_command(label="Hide panel", command=self._hide_panel)
+            menu.add_command(label="Hide panel", command=lambda: self._collapse())
         else:
-            menu.add_command(label="Show panel", command=self._expand)
+            menu.add_command(label="Show panel", command=lambda: self._expand())
+        menu.add_command(label="Clear activity", command=self._clear_feed)
         menu.add_command(label="Quit Screeny", command=self._on_close)
         menu.tk_popup(event.x_root, event.y_root)
 
-    def _hide_panel(self) -> None:
-        self._set_pinned(False)
-        self._collapse()
-
-    def _show_active_panels(self) -> None:
-        """Prepare the feed but stay collapsed — hover reveals the panel."""
-        if not self.feed_label.winfo_ismapped():
-            self.feed_label.pack(pady=24)
-
-    def _hide_active_panels(self) -> None:
-        self._set_pinned(False)
-        self._collapse(animated=True)
-
-    # ----------------------------------------------------------------- toggles
     def _on_mic_toggle(self) -> None:
         self._mic_muted = not self._mic_muted
-        if self._mic_muted:
-            self.mic_btn.configure(text="🔇", text_color="#ff453a")
-            if self._state == AgentState.LISTENING:
-                self._post("state", AgentState.IDLE)
-        else:
-            self.mic_btn.configure(text="🎤", text_color=MUTED)
+        if self._mic_muted and self._state == AgentState.LISTENING:
+            self._post("state", AgentState.IDLE)
 
-    def _on_toggle(self) -> None:
-        if self.toggle.get():
-            self._activate()
-        else:
-            self._deactivate()
-
-    def _on_submit_text(self, _event=None) -> None:
-        text = self.command_entry.get().strip()
+    def _submit_command(self, text: str | None = None) -> None:
+        if text is None:
+            text = self.cmdbar.entry.get().strip()
         if not text:
             return
         if not self._active:
-            self.toggle.select()
             self._activate()
-        self.command_entry.delete(0, "end")
+        self.cmdbar.entry.delete(0, "end")
+        self._last_command = text
         self._add_feed("you", text)
         self._command_queue.put(text)
+
+    def _retry_last(self) -> None:
+        if self._last_command:
+            self._submit_command(self._last_command)
 
     # --------------------------------------------------------------- lifecycle
     def _activate(self) -> None:
@@ -531,8 +499,8 @@ class ScreenyApp(ctk.CTk):
         self._active = True
         self._stop_event.clear()
         self._ollama_ready.clear()
-        self._show_active_panels()
-        self._post("state", AgentState.WORKING)
+        self._substatus = "Connecting to Ollama…"
+        self.hero.set_state("IDLE", "Screeny · Ready", self._substatus)
         threading.Thread(target=self._warm_ollama, daemon=True).start()
         self._worker = threading.Thread(target=self._agent_loop, daemon=True)
         self._worker.start()
@@ -541,7 +509,9 @@ class ScreenyApp(ctk.CTk):
     def _warm_ollama(self) -> None:
         try:
             ensure_ollama_running()
+            self._post("conn", True)
         except Exception as exc:
+            self._post("conn", False)
             self._post("feed", ("error", str(exc)))
         finally:
             self._ollama_ready.set()
@@ -565,7 +535,7 @@ class ScreenyApp(ctk.CTk):
                 break
         self._post("state", AgentState.OFF)
         self._post("ask_hide", None)
-        self._hide_active_panels()
+        self._collapse(animated=True)
 
     # ------------------------------------------------------------- agent loop
     def _agent_loop(self) -> None:
@@ -606,6 +576,7 @@ class ScreenyApp(ctk.CTk):
                     self._post("state", AgentState.IDLE)
                 continue
 
+            self._last_command = heard
             self._add_feed("you", heard)
             self._start_task(heard)
 
@@ -617,6 +588,8 @@ class ScreenyApp(ctk.CTk):
 
         self._voice.stop()
         self._task_running = True
+        self._last_command = text
+        self._substatus = "Starting…"
 
         self._ask_abort.set()
         self._ask_abort = threading.Event()
@@ -630,6 +603,7 @@ class ScreenyApp(ctk.CTk):
         def run() -> None:
             self._task_running = True
             self._post("state", AgentState.WORKING)
+            ok = True
             try:
                 reply = handle_command(
                     text,
@@ -641,12 +615,15 @@ class ScreenyApp(ctk.CTk):
                 self._task_running = False
                 if self._active and not cancel.is_set():
                     self._speak_async(reply)
+                    self._post("task_done", True)
             except Exception as exc:
                 self._task_running = False
+                ok = False
                 if self._active and not cancel.is_set():
                     err = str(exc).strip() or exc.__class__.__name__
                     self._post("feed", ("error", err))
                     self._speak_async(f"Sorry, something went wrong. {err[:120]}")
+                    self._post("task_done", False)
             finally:
                 self._task_running = False
                 if self._active and not cancel.is_set():
@@ -671,6 +648,18 @@ class ScreenyApp(ctk.CTk):
 
     def _ev_status(self, text: str) -> None:
         self._post("status", _trim(text, 80))
+
+    def _ev_substatus(self, text: str) -> None:
+        self._post("substatus", _trim(text, 80))
+
+    def _ev_task_done(self, ok: bool) -> None:
+        self._post("task_done", ok)
+
+    def _ev_connection(self, ok: bool) -> None:
+        self._post("conn", ok)
+
+    def _ev_install_phase(self, idx: int, frac: float = 1.0) -> None:
+        self._post("install_phase", (idx, frac))
 
     def _ev_ask(self, prompt: str, secret: bool = False) -> str | None:
         if not self._active:
@@ -697,9 +686,9 @@ class ScreenyApp(ctk.CTk):
         self.ask_entry.configure(show="*" if secret else "")
         self._set_pinned(True)
         if not self._expanded:
-            self._expand(animated=True)
+            self._expand(animated=True, auto=True)
         if not self.ask_panel.winfo_ismapped():
-            self.ask_panel.pack(fill="x", padx=14, pady=(0, 6), before=self.input_row)
+            self.ask_panel.pack(fill="x", padx=Space.M, pady=(0, Space.S), before=self.cmdbar)
         self._set_state(AgentState.ASKING)
         self.ask_entry.focus_set()
 
@@ -721,7 +710,7 @@ class ScreenyApp(ctk.CTk):
         if self._active:
             self._set_state(AgentState.WORKING)
         self._set_pinned(False)
-        self._schedule_hover_collapse()
+        self._schedule_auto_collapse()
         done.set()
 
     def _on_ask_skip(self) -> None:
@@ -733,7 +722,7 @@ class ScreenyApp(ctk.CTk):
         if self._active:
             self._set_state(AgentState.WORKING)
         self._set_pinned(False)
-        self._schedule_hover_collapse()
+        self._schedule_auto_collapse()
         done.set()
 
     # ----------------------------------------------------------------- speech
@@ -744,7 +733,6 @@ class ScreenyApp(ctk.CTk):
             done.wait(timeout=120)
 
     def _speak_async(self, text: str) -> None:
-        """Queue speech without blocking the agent — UI stays responsive."""
         self._queue_speak(text, wait=False)
 
     def _speak_on_main_thread(self, text: str, done: threading.Event | None = None) -> None:
@@ -754,7 +742,11 @@ class ScreenyApp(ctk.CTk):
                 done.set()
             return
         self._add_feed("screeny", cleaned)
-        self._set_state(AgentState.SPEAKING)
+        self._state = AgentState.SPEAKING
+        if self._group is None:
+            self.hero.set_state("SPEAKING", "Screeny", cleaned[:60])
+        else:
+            self._set_state(AgentState.SPEAKING)
 
         def _on_done() -> None:
             self._post("speak_done", done)
@@ -784,6 +776,10 @@ class ScreenyApp(ctk.CTk):
                 self._set_state(payload)
             elif kind == "status":
                 self._set_status_line(payload)
+            elif kind == "substatus":
+                self._substatus = str(payload)
+                if self._state == AgentState.WORKING:
+                    self._refresh_hero()
             elif kind == "speak":
                 text, done = payload
                 self._speak_on_main_thread(str(text), done)
@@ -791,13 +787,33 @@ class ScreenyApp(ctk.CTk):
                 self._finish_speaking(payload)
             elif kind == "feed":
                 self._add_feed(payload[0], payload[1])
+            elif kind == "install_phase":
+                idx, frac = payload
+                self._set_install_phase(int(idx), float(frac))
             elif kind == "ask":
                 self._show_ask(*payload)
             elif kind == "ask_hide":
                 self._hide_ask()
             elif kind == "toggle_off":
-                self.toggle.deselect()
                 self._deactivate()
+            elif kind == "conn":
+                self._ollama_connected = bool(payload)
+                self.hero.conn.set_online(self._ollama_connected)
+                self.settings.set_connection(self._ollama_connected)
+                if self._active and not self._task_running:
+                    self._substatus = (
+                        "Connected to Ollama" if self._ollama_connected else "Ollama not running"
+                    )
+                    self._refresh_hero()
+            elif kind == "task_done":
+                ok = bool(payload)
+                self._install_active = False
+                if self._group:
+                    self._group.set_result(ok)
+                    if ok:
+                        self._add_feed("ok", "All done.")
+                if self._state == AgentState.IDLE:
+                    self._schedule_auto_collapse()
 
         self.after(80, self._poll_events)
 
@@ -806,25 +822,39 @@ class ScreenyApp(ctk.CTk):
         text = str(text).strip()
         if not text:
             return
-        if self.feed_label.winfo_ismapped():
-            self.feed_label.pack_forget()
+        if self.empty.winfo_ismapped():
+            self.empty.pack_forget()
 
-        label, color = FEED_STYLE.get(kind, ("•", MUTED))
+        if kind == "you":
+            if self._group and self._group._open:
+                self._group.toggle()
+            self._task_summary = text[:40].capitalize()
+            self._group = TaskGroup(self.feed, command_text=text)
+            self._group.pack(fill="x", pady=(0, Space.S))
+            self._task_groups.append(self._group)
+            if len(self._task_groups) > self.MAX_TASK_GROUPS:
+                old = self._task_groups.pop(0)
+                old.destroy()
+            self._on_feed_resize()
+            self._refresh_hero()
+            return
 
-        row = ctk.CTkLabel(
-            self.feed,
-            text=f"{label}   {text}",
-            anchor="w", justify="left",
-            font=ctk.CTkFont(size=11),
-            text_color=color,
-            wraplength=self.WIDTH - 48,
+        if self._group is None:
+            if kind != "error":
+                return
+            self._group = TaskGroup(self.feed, command_text="Startup")
+            self._group.pack(fill="x", pady=(0, Space.S))
+            self._task_groups.append(self._group)
+            self._on_feed_resize()
+
+        self._group.add_card(
+            kind, text,
+            on_retry=self._retry_last if kind == "error" else None,
         )
-        row.pack(fill="x", padx=14, pady=3)
-
-        self._feed_rows.append(row)
-        if len(self._feed_rows) > self.MAX_FEED_ROWS:
-            old = self._feed_rows.pop(0)
-            old.destroy()
+        if kind == "error":
+            self._group.set_result(False)
+            if not self._expanded:
+                self._expand(animated=True, auto=True)
 
         self.update_idletasks()
         try:
@@ -832,19 +862,45 @@ class ScreenyApp(ctk.CTk):
         except Exception:
             pass
 
+    def _set_install_phase(self, idx: int, frac: float = 1.0) -> None:
+        self._install_active = True
+        self._journey_state = (idx, frac)
+        try:
+            if self._expanded and not self._install_progress_visible:
+                self.journey.pack(fill="x", padx=Space.S, pady=(0, Space.S), after=self.divider)
+                self._install_progress_visible = True
+            if self._install_progress_visible:
+                self.journey.set_phase(idx, frac)
+        except tk.TclError:
+            self._install_progress_visible = False
+
     def _clear_feed(self) -> None:
-        for row in self._feed_rows:
-            row.destroy()
-        self._feed_rows.clear()
-        if not self.feed_label.winfo_ismapped():
-            self.feed_label.pack(pady=24)
+        for group in self._task_groups:
+            group.destroy()
+        self._task_groups.clear()
+        self._group = None
+        if not self.empty.winfo_ismapped():
+            self.empty.pack(fill="x")
 
     def _set_status_line(self, text: str) -> None:
         if not self._active or not text:
             return
         if self._state in {AgentState.ASKING, AgentState.SPEAKING}:
             return
-        self._set_state(AgentState.WORKING, text)
+        self._substatus = text
+        if self._state == AgentState.WORKING:
+            self._refresh_hero()
+
+    def _refresh_hero(self) -> None:
+        orb = ORB_MAP.get(self._state, "IDLE")
+        if self._state == AgentState.WORKING:
+            head = self._task_summary or "Working…"
+            sub = self._substatus or "Thinking…"
+        else:
+            head, sub = _HEADLINES.get(orb, ("Screeny", ""))
+            if self._substatus and orb in {"IDLE", "OFF"}:
+                sub = self._substatus
+        self.hero.set_state(orb, head, sub)
 
     def _set_state(self, state: AgentState, message: str | None = None) -> None:
         if self._state == AgentState.ASKING and state not in {
@@ -853,44 +909,23 @@ class ScreenyApp(ctk.CTk):
             return
 
         self._state = state
-        title, subtitle, color = STATE_META[state]
-        if message:
-            subtitle = message
-        self.title_label.configure(text=title)
-        self.subtitle_label.configure(text=subtitle)
-        self.status_dot.configure(text_color=color)
-
-        show_wave = state in {
-            AgentState.LISTENING, AgentState.WORKING, AgentState.SPEAKING,
-        }
-        if show_wave and self._active:
-            if not self.wave_frame.winfo_ismapped():
-                self.wave_frame.pack(side="left", expand=True, padx=12)
-            self._animate_wave(color)
+        orb = ORB_MAP.get(state, "IDLE")
+        if state == AgentState.WORKING:
+            head = self._task_summary or "Working…"
+            sub = message or self._substatus or "Thinking…"
         else:
-            self._pulse_on = False
-            self.wave_frame.pack_forget()
+            head, sub = _HEADLINES.get(orb, ("Screeny", ""))
+            if message:
+                sub = message
 
-    def _animate_wave(self, color: str) -> None:
-        if self._state not in {AgentState.LISTENING, AgentState.WORKING, AgentState.SPEAKING}:
-            return
-        self._pulse_on = not self._pulse_on
-        if self._state == AgentState.SPEAKING:
-            levels = [0.9, 0.5, 1.0, 0.35, 0.75, 0.95, 0.55] if self._pulse_on else [
-                0.4, 0.85, 0.3, 0.7, 0.5, 0.65, 0.45
-            ]
-        elif self._state == AgentState.LISTENING:
-            levels = [0.6, 0.85, 0.45, 0.95, 0.55, 0.8, 0.5] if self._pulse_on else [
-                0.3, 0.55, 0.25, 0.7, 0.35, 0.6, 0.3
-            ]
-        else:
-            levels = [0.35, 0.5, 0.3, 0.55, 0.4, 0.45, 0.35] if self._pulse_on else [
-                0.2, 0.35, 0.15, 0.4, 0.25, 0.3, 0.2
-            ]
-        for bar, level in zip(self.wave_bars, levels, strict=True):
-            bar.set(level)
-            bar.configure(progress_color=color)
-        self.after(120, lambda: self._animate_wave(color))
+        self.hero.set_state(orb, head, sub)
+
+        if state == AgentState.ASKING:
+            self._expand(animated=True, auto=True)
+        elif state == AgentState.IDLE:
+            if not self._task_running:
+                self._substatus = ""
+            self._schedule_auto_collapse()
 
     def _on_close(self) -> None:
         self._deactivate()
@@ -907,6 +942,7 @@ def run_ui() -> int:
         print(voice_install_hint())
         return 1
 
+    enable_dpi_awareness()  # no-op if already set in main.py
     app = ScreenyApp()
     app.mainloop()
     return 0

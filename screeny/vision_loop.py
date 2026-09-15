@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from screeny.actions import (
@@ -41,6 +41,7 @@ from screeny.progress_check import (
     find_vendor_download_target,
     find_windows_platform_target,
     find_wizard_button_target,
+    filter_vendor_candidates,
     goal_is_install_like,
     is_browser_download_click,
     is_distractor_click,
@@ -60,21 +61,69 @@ from screeny.page_context import (
     find_official_search_result,
     looks_like_google_results,
     on_vendor_or_app_page,
+    url_from_link_text,
 )
 from screeny.screen import Capture, capture_primary_monitor
 from screeny.session_log import log as session_log
+from screeny.install_phases import InstallPhase, detect_install_phase, phase_to_progress_index
 from screeny.ui_grounding import (
     UIElement,
     best_match,
+    browser_viewport_rect,
     click_point_for_element,
+    filter_elements_for_browser,
     format_elements,
     get_clickable_elements,
+    in_viewport,
     interact_element,
     is_taskbar_zone,
+    page_signature,
     pick_by_label,
+    wait_for_page_settle,
 )
+from screeny.vendor_download_locator import locate_vendor_download, ocr_viewport
 
 SpeakFn = Callable[[str], None]
+
+ESCALATION: dict[str, str] = {
+    "uia": "ocr",
+    "ocr": "scroll",
+    "scroll": "grid",
+    "grid": "vision",
+    "vision": "stuck",
+}
+
+
+@dataclass
+class EscalationState:
+    tier: str = "uia"
+    last_key: tuple[str, str, int, int] | None = None
+    repeats: int = 0
+    banned_targets: set[str] = field(default_factory=set)
+
+
+def _action_key_tier(action: str, tier: str, x: int, y: int) -> tuple[str, str, int, int]:
+    return (action, tier, x // 40, y // 40)
+
+
+def register_outcome(
+    state: EscalationState,
+    key: tuple[str, str, int, int],
+    *,
+    blocked: bool,
+    target_name: str = "",
+) -> str:
+    if blocked and target_name:
+        state.banned_targets.add(target_name.strip().lower())
+    if blocked or key == state.last_key:
+        state.repeats += 1
+    else:
+        state.last_key, state.repeats = key, 1
+    if state.repeats >= 2:
+        state.tier = ESCALATION.get(state.tier, "stuck")
+        state.repeats = 0
+        session_log(f"escalate tier -> {state.tier}")
+    return state.tier
 
 
 @dataclass
@@ -127,33 +176,135 @@ def _auto_open_download(
     return None
 
 
+def _download_wait_loop(
+    *,
+    download_click_ts: float,
+    events: AgentEvents,
+    stop_event: threading.Event | None,
+    cancel_event: threading.Event | None,
+    opened_installers: set[str],
+    progress: TaskProgress,
+    timeout: float = 90.0,
+) -> tuple[str, bool, bool]:
+    """Pure polling. No element scan, no LLM, no browser clicks except auto-open."""
+    deadline = download_click_ts + timeout
+    while time.time() < deadline:
+        if _should_stop(stop_event, cancel_event):
+            return "Stopped.", False, False
+        opened = _auto_open_download(
+            download_click_ts,
+            events,
+            stop_event,
+            cancel_event,
+            opened_installers,
+            timeout=5.0,
+        )
+        if opened is not None and opened.ok:
+            progress.note_installer_launched()
+            return _wizard_open_message(opened.detail), True, True
+        if download_in_progress(download_click_ts):
+            deadline = time.time() + timeout
+        time.sleep(2.0)
+    return "", False, False
+
+
+def _save_ocr_miss_debug(
+    capture: Capture,
+    viewport: tuple[int, int, int, int],
+    *,
+    step: int,
+    used_fallback_vp: bool,
+) -> None:
+    """Save viewport crop and log OCR words when DOWNLOAD is not found."""
+    left, top, right, bottom = viewport
+    debug_dir = SETTINGS.screenshot_dir.parent / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from screeny.screen import crop_native_image
+
+        crop_img, _, _, _, _ = crop_native_image(capture, left, top, right, bottom)
+        path = debug_dir / f"ocr_miss_step{step}.png"
+        crop_img.save(path)
+    except Exception as exc:
+        session_log(f"ocr miss debug save failed: {exc}")
+        return
+    detections = ocr_viewport(capture, viewport)
+    top_words = sorted(detections, key=lambda d: d[2], reverse=True)[:10]
+    words = ", ".join(f"{t!r}:{c:.2f}" for _, t, c in top_words)
+    session_log(
+        f"ocr miss step {step}: vp={viewport} native={capture.native_width}x{capture.native_height} "
+        f"fallback_vp={used_fallback_vp} top10=[{words}] saved={path.name}"
+    )
+
+
 def _click_vendor_download_via_ocr(
     capture: Capture,
+    *,
+    allow_scroll: bool = True,
+    step: int = 0,
 ) -> ActionResult | None:
-    """OCR/grid fallback when UIA misses or misplaces the hero Download button."""
-    rect = get_foreground_window_rect()
-    if rect is None:
-        return None
-    from screeny.window_pointer import find_in_window
+    """OCR-first DOWNLOAD with viewport crop, scoring, and optional scroll."""
+    vp = browser_viewport_rect(capture.native_width, capture.native_height)
+    used_fallback_vp = vp is None
+    if vp is None:
+        rect = get_foreground_window_rect()
+        if rect is None:
+            return None
+        vp = rect
+        session_log(f"ocr viewport fallback: foreground window {vp}")
 
-    taskbar_y = int(capture.native_height * 0.88)
-    best_pt = None
-    for query in ("DOWNLOAD", "Download the game", "Download"):
-        pt = find_in_window(query, capture, rect)
-        if pt is None or "download" not in pt.label.lower():
-            continue
-        if pt.y >= taskbar_y:
-            continue
-        if best_pt is None or pt.y > best_pt.y:
-            best_pt = pt
-    if best_pt is None:
+    hit = locate_vendor_download(capture, vp)
+    if hit is None and allow_scroll:
+        from screeny.vendor_download_locator import MAX_SCROLLS
+
+        for _ in range(MAX_SCROLLS):
+            execute(
+                {"action": "scroll", "amount": -600},
+                screen_width=capture.native_width,
+                screen_height=capture.native_height,
+            )
+            time.sleep(SETTINGS.page_load_wait)
+            try:
+                capture = capture_primary_monitor()
+            except Exception:
+                break
+            vp = browser_viewport_rect(capture.native_width, capture.native_height) or vp
+            hit = locate_vendor_download(capture, vp)
+            if hit is not None:
+                break
+
+    if hit is None:
+        from screeny.window_pointer import find_in_window
+
+        taskbar_y = int(capture.native_height * 0.88)
+        best_pt = None
+        for query in ("DOWNLOAD", "Download"):
+            pt = find_in_window(query, capture, vp)
+            if pt is None or "download" not in pt.label.lower():
+                continue
+            if pt.y >= taskbar_y:
+                continue
+            if best_pt is None or pt.y > best_pt.y:
+                best_pt = pt
+        if best_pt is None:
+            if step:
+                _save_ocr_miss_debug(
+                    capture, vp, step=step, used_fallback_vp=used_fallback_vp
+                )
+            return None
+        hit_x, hit_y, hit_label = best_pt.x, best_pt.y, best_pt.label
+    else:
+        hit_x, hit_y, hit_label = hit.x, hit.y, hit.text
+
+    if not in_viewport(hit_x, hit_y, vp):
         return None
+
     try:
         return execute(
             {
                 "action": "click",
-                "x": best_pt.x,
-                "y": best_pt.y,
+                "x": hit_x,
+                "y": hit_y,
                 "_native": True,
                 "_hybrid": True,
             },
@@ -174,30 +325,41 @@ def _after_vendor_download_click(
     progress: TaskProgress,
     events: AgentEvents,
     history: list[str],
-    opened_installers: set[str],
-    stop_event: threading.Event | None,
-    cancel_event: threading.Event | None,
-) -> tuple[str, bool, float]:
-    """Shared bookkeeping after clicking a vendor Download control."""
+) -> tuple[str, float]:
+    """Record a confirmed vendor download click; polling happens in DOWNLOAD_WAIT."""
     progress.note_vendor_site()
     progress.note_download_click()
     ts = time.time()
     last_result = f"Clicked {label} — waiting for installer download."
     history.append(f"step {step}: vendor download -> {detail}")
     session_log(f"vision step {step} vendor download: {label[:60]}")
+    session_log(f"vision step {step} phase -> DOWNLOAD_WAIT (LLM locked)")
     events.on_action(detail)
-    opened = _auto_open_download(
-        ts, events, stop_event, cancel_event, opened_installers
-    )
-    setup = False
-    if opened is not None and opened.ok:
-        progress.note_installer_launched()
-        last_result = _wizard_open_message(opened.detail)
-        if "already opened" not in opened.detail:
-            events.on_action(opened.detail)
-        history.append(f"step {step}: auto-opened installer after download")
-        setup = True
-    return last_result, setup, ts
+    return last_result, ts
+
+
+def _is_vendor_download_click(
+    target: str,
+    element: UIElement | None,
+    *,
+    on_vendor_page: bool,
+    viewport: tuple[int, int, int, int] | None,
+    click_y: int,
+) -> bool:
+    """Download intent counts ONLY on a vendor page, in the content area."""
+    if not on_vendor_page or viewport is None:
+        return False
+    left, top, right, bottom = viewport
+    vh = max(1, bottom - top)
+    if click_y < top + 0.18 * vh or click_y > bottom:
+        return False
+    blob = f"{target} {element.name if element else ''}".lower()
+    if re.search(
+        r"\b(play|launch|sign[ -]?in|log[ -]?in|mac|ios|android|app store)\b",
+        blob,
+    ):
+        return False
+    return bool(re.search(r"\b(download|install now|get for windows)\b", blob))
 
 
 _WIZARD_KEYWORDS = (
@@ -217,24 +379,6 @@ _WIZARD_KEYWORDS = (
     "get started",
     "i agree",
 )
-
-
-def _is_download_intent(target: str, element: UIElement | None = None) -> bool:
-    """True when a click likely started a file download (not nav CTAs like Play Now)."""
-    blob = f"{target} {element.name if element else ''}".lower()
-    if element is not None and element.kind in {"button", "link"}:
-        name = element.name.lower()
-        if "download" in name and not re.search(
-            r"\b(mac|ios|android|app store)\b", name
-        ):
-            return True
-    if re.search(r"\b(free download|install now)\b", blob):
-        return True
-    if re.search(r"\bdownload\b", blob) and not re.search(
-        r"\b(play now|play free|play for free|google search)\b", blob
-    ):
-        return True
-    return False
 
 
 def _click_target(decision: dict) -> str:
@@ -346,6 +490,7 @@ def run_vision_task(
     last_screen_hash: str | None = None
     last_was_wait = False
     progress = TaskProgress()
+    escalate_state = EscalationState()
     task_started_at = time.time()
     install_task = goal_is_install_like(goal)
 
@@ -384,10 +529,37 @@ def run_vision_task(
         if SETTINGS.save_screenshots:
             _save_shot(capture, step)
         screen_hash = _screen_hash(capture)
+        page_sig = page_signature()
 
         installer_phase = _in_installer_phase(
             progress, setup_wizard_active, opened_installers
         )
+
+        if (
+            install_task
+            and progress.download_clicked
+            and not progress.installer_launched
+            and not installer_phase
+        ):
+            since = download_click_ts if download_click_ts else task_started_at
+            last_result, setup_wizard_active, ok = _download_wait_loop(
+                download_click_ts=since,
+                events=events,
+                stop_event=stop_event,
+                cancel_event=cancel_event,
+                opened_installers=opened_installers,
+                progress=progress,
+            )
+            if ok:
+                installer_phase = True
+                _try_focus_installer(progress, after_download=True)
+            elif not ok and not last_result:
+                progress.download_clicked = False
+                download_click_ts = 0.0
+                last_result = "Download never appeared — retrying the download button."
+                session_log("DOWNLOAD_WAIT timeout — reset download_clicked")
+            last_was_wait = False
+            continue
 
         # Once download ran or we launched an .exe, hunt for the installer every step.
         if install_task and (progress.download_clicked or opened_installers):
@@ -417,6 +589,45 @@ def run_vision_task(
                 foreground_first=installer_phase,
                 foreground_only=installer_phase,
             )
+
+        browser_vp: tuple[int, int, int, int] | None = None
+        if install_task and not installer_phase:
+            browser_vp = browser_viewport_rect(
+                capture.native_width, capture.native_height
+            )
+            elements = filter_elements_for_browser(
+                elements,
+                browser_vp,
+                screen_width=capture.native_width,
+                screen_height=capture.native_height,
+            )
+            if on_vendor_or_app_page(elements):
+                elements = filter_vendor_candidates(elements, browser_vp)
+            elif install_task and not looks_like_google_results(elements):
+                elements = filter_vendor_candidates(elements, browser_vp)
+        if escalate_state.banned_targets:
+            elements = [
+                e
+                for e in elements
+                if e.name.strip().lower() not in escalate_state.banned_targets
+            ]
+
+        if install_task:
+            phase = detect_install_phase(
+                goal=goal,
+                elements=elements,
+                download_clicked=progress.download_clicked,
+                installer_launched=progress.installer_launched,
+                wizard_active=setup_wizard_active,
+            )
+            if phase is not None:
+                idx = phase_to_progress_index(phase)
+                if idx is not None:
+                    frac = 0.4 if phase in {
+                        InstallPhase.VENDOR_PAGE,
+                        InstallPhase.DOWNLOAD_WAIT,
+                    } else 1.0
+                    events.on_install_phase(idx, frac)
 
         active_goal = _wizard_goal(goal) if installer_phase else goal
         window_rect = get_foreground_window_rect() if installer_phase else None
@@ -483,13 +694,18 @@ def run_vision_task(
         ):
             hit = find_official_search_result(elements, goal)
             if hit is not None:
+                prev_sig = page_sig
                 ok, detail = interact_element(hit)
                 if ok:
                     progress.note_vendor_site()
+                    dest = url_from_link_text(hit.name)
+                    SESSION.note_left_google_search(dest)
                     last_result = f"Opened official result: {hit.name[:80]}"
                     history.append(f"step {step}: auto google result -> {detail}")
                     events.on_action(detail)
                     session_log(f"vision step {step} auto google: {hit.name[:60]}")
+                    wait_for_page_settle(prev_sig)
+                    session_log(f"vision step {step} page settled after google")
                     last_was_wait = False
                     continue
 
@@ -501,18 +717,19 @@ def run_vision_task(
             and not progress.installer_launched
             and on_vendor_or_app_page(elements)
         ):
-            ocr_result = _click_vendor_download_via_ocr(capture)
+            ocr_result = _click_vendor_download_via_ocr(
+                capture,
+                step=step,
+                allow_scroll=escalate_state.tier in {"ocr", "scroll", "grid", "vision"},
+            )
             if ocr_result is not None and ocr_result.ok:
-                last_result, setup_wizard_active, download_click_ts = _after_vendor_download_click(
+                last_result, download_click_ts = _after_vendor_download_click(
                     step=step,
                     detail=ocr_result.detail,
                     label="DOWNLOAD",
                     progress=progress,
                     events=events,
                     history=history,
-                    opened_installers=opened_installers,
-                    stop_event=stop_event,
-                    cancel_event=cancel_event,
                 )
                 last_was_wait = False
                 continue
@@ -521,16 +738,13 @@ def run_vision_task(
             if dl is not None:
                 ok, detail = interact_element(dl)
                 if ok:
-                    last_result, setup_wizard_active, download_click_ts = _after_vendor_download_click(
+                    last_result, download_click_ts = _after_vendor_download_click(
                         step=step,
                         detail=detail,
                         label=dl.name,
                         progress=progress,
                         events=events,
                         history=history,
-                        opened_installers=opened_installers,
-                        stop_event=stop_event,
-                        cancel_event=cancel_event,
                     )
                     last_was_wait = False
                     continue
@@ -554,6 +768,9 @@ def run_vision_task(
                     history.append(f"step {step}: auto vendor CTA -> {detail}")
                     events.on_action(detail)
                     session_log(f"vision step {step} auto vendor CTA: {cta.name[:60]}")
+                    if cta.kind == "link":
+                        wait_for_page_settle(page_sig)
+                        session_log(f"vision step {step} page settled after vendor CTA")
                     last_was_wait = False
                     continue
 
@@ -598,13 +815,25 @@ def run_vision_task(
         last_screen_hash = screen_hash
 
         min_elements = 2 if settings_toggle_task else SETTINGS.text_only_min_elements
-        # Browser-phase installs: UIA + text LLM is faster than full vision — same labels.
+        # Browser install: planner-only (no vision model swap). Other tasks: text when UIA is rich.
         use_text_only = (
             not installer_phase
             and not setup_wizard_active
-            and not _likely_custom_ui(elements)
-            and len(elements) >= min_elements
+            and (
+                (install_task and not _likely_custom_ui(elements))
+                or (
+                    not _likely_custom_ui(elements)
+                    and len(elements) >= min_elements
+                )
+            )
         )
+
+        if escalate_state.tier == "stuck":
+            return VisionRunResult(
+                False,
+                step,
+                "I got stuck repeating the same action after trying every locator tier, so I stopped.",
+            )
 
         if installer_phase:
             stall_hint = (
@@ -641,6 +870,35 @@ def run_vision_task(
                     fast_wizard_done = True
                     break
         if fast_wizard_done:
+            continue
+
+        on_vendor = (
+            install_task
+            and not installer_phase
+            and not progress.download_clicked
+            and on_vendor_or_app_page(elements)
+        )
+        if on_vendor:
+            tier = register_outcome(
+                escalate_state,
+                _action_key_tier("ocr", escalate_state.tier, 0, 0),
+                blocked=False,
+            )
+            if tier == "stuck":
+                return VisionRunResult(
+                    False,
+                    step,
+                    "Could not find a DOWNLOAD button on the vendor page after trying every method.",
+                )
+            session_log(
+                f"vision step {step} vendor page: skipping LLM (tier={escalate_state.tier})"
+            )
+            last_result = (
+                "On the vendor site — scanning for the DOWNLOAD button. "
+                "Do not click Play / Sign in navigation links."
+            )
+            time.sleep(1.5)
+            last_was_wait = False
             continue
 
         try:
@@ -689,9 +947,30 @@ def run_vision_task(
                 )
         except OllamaError as exc:
             return VisionRunResult(False, step, str(exc))
+        except json.JSONDecodeError as exc:
+            return VisionRunResult(False, step, f"The planner returned invalid JSON: {exc}")
 
         thought = str(decision.get("thought", "")).strip()
         action_name = normalize_action_name(decision.get("action", ""))
+        if not action_name:
+            decision = dict(decision)
+            if decision.get("label") is not None or decision.get("id") is not None:
+                if decision.get("label") is None and decision.get("id") is not None:
+                    decision["label"] = decision["id"]
+                decision["action"] = "click"
+                action_name = "click"
+            elif thought and re.search(r"\b(click|download|install|wait)\b", thought, re.I):
+                decision["action"] = "wait"
+                decision["seconds"] = 1
+                action_name = "wait"
+                last_result = (
+                    'Model omitted "action" — waiting 1s. Use '
+                    '{"action":"click","label":N} from the numbered list.'
+                )
+            else:
+                decision["action"] = "wait"
+                decision["seconds"] = 1
+                action_name = "wait"
         if thought:
             print(f"  think: {thought}")
             session_log(f"vision step {step} think: {thought[:200]}")
@@ -747,9 +1026,33 @@ def run_vision_task(
             len(recent_actions) >= SETTINGS.vision_stall_limit
             and len(set(recent_actions)) == 1
         ):
-            return VisionRunResult(
-                False, step, "I got stuck repeating the same action, so I stopped."
+            click_x, click_y = 0, 0
+            if action_name == "click":
+                try:
+                    click_x, click_y = resolve_coords(
+                        decision,
+                        screen_width=capture.native_width,
+                        screen_height=capture.native_height,
+                        image_width=capture.width,
+                        image_height=capture.height,
+                    )
+                except CoordError:
+                    pass
+            tier = register_outcome(
+                escalate_state,
+                _action_key_tier(action_name, escalate_state.tier, click_x, click_y),
+                blocked=False,
             )
+            recent_actions.clear()
+            if tier == "stuck":
+                return VisionRunResult(
+                    False, step, "I got stuck repeating the same action, so I stopped."
+                )
+            last_result = (
+                f"Same action repeated — escalating locator tier to {escalate_state.tier}."
+            )
+            last_was_wait = False
+            continue
 
         if action_name == "wait":
             consecutive_waits += 1
@@ -851,6 +1154,7 @@ def run_vision_task(
             continue
 
         clicked_download_button = False
+        click_element: UIElement | None = None
         use_visual_grounding = installer_phase or _likely_custom_ui(elements)
         if action_name == "click":
             target = _click_target(decision)
@@ -933,26 +1237,19 @@ def run_vision_task(
                 if dl is not None:
                     element = dl
                     target = dl.name
-                    clicked_download_button = True
                 else:
-                    ocr_result = _click_vendor_download_via_ocr(capture)
+                    ocr_result = _click_vendor_download_via_ocr(capture, step=step)
                     if ocr_result is not None and ocr_result.ok:
-                        last_result, setup_wizard_active, download_click_ts = (
-                            _after_vendor_download_click(
-                                step=step,
-                                detail=ocr_result.detail,
-                                label="DOWNLOAD",
-                                progress=progress,
-                                events=events,
-                                history=history,
-                                opened_installers=opened_installers,
-                                stop_event=stop_event,
-                                cancel_event=cancel_event,
-                            )
+                        last_result, download_click_ts = _after_vendor_download_click(
+                            step=step,
+                            detail=ocr_result.detail,
+                            label="DOWNLOAD",
+                            progress=progress,
+                            events=events,
+                            history=history,
                         )
                         history.append(f"step {step}: redirect play-now -> ocr download")
                         session_log(f"vision step {step} redirect to ocr download")
-                        events.on_action(ocr_result.detail)
                         last_was_wait = False
                         continue
 
@@ -976,6 +1273,20 @@ def run_vision_task(
                 progress.off_track_clicks += 1
                 last_result = msg
                 history.append(f"step {step}: blocked bad click")
+                block_name = (element.name if element else target) or ""
+                bx, by = (element.cx, element.cy) if element else (0, 0)
+                tier = register_outcome(
+                    escalate_state,
+                    _action_key_tier("click", escalate_state.tier, bx, by),
+                    blocked=True,
+                    target_name=block_name,
+                )
+                if tier == "stuck":
+                    return VisionRunResult(
+                        False,
+                        step,
+                        "I kept hitting blocked targets and ran out of locator tiers, so I stopped.",
+                    )
                 if installer_phase:
                     _try_focus_installer(progress, after_download=True)
                 if progress.off_track_clicks >= 3 and not installer_phase:
@@ -1012,7 +1323,14 @@ def run_vision_task(
                 decision["x"] = cx
                 decision["y"] = cy
                 decision["_native"] = True
-                if _is_download_intent(target, element):
+                click_element = element
+                if _is_vendor_download_click(
+                    target,
+                    element,
+                    on_vendor_page=on_vendor_or_app_page(elements),
+                    viewport=browser_vp,
+                    click_y=cy,
+                ):
                     clicked_download_button = True
                 print(f"  pick:  {element.kind} '{element.name}' @ ({cx},{cy})")
             else:
@@ -1050,7 +1368,23 @@ def run_vision_task(
                 ):
                     frac = 0.42 if _is_wizard_target(target) else SETTINGS.refine_frac
                     decision = _refine_click(capture, decision, frac=frac)
-                if _is_download_intent(target, None):
+                try:
+                    gx, gy = resolve_coords(
+                        decision,
+                        screen_width=capture.native_width,
+                        screen_height=capture.native_height,
+                        image_width=capture.width,
+                        image_height=capture.height,
+                    )
+                except CoordError:
+                    gx, gy = 0, 0
+                if _is_vendor_download_click(
+                    target,
+                    None,
+                    on_vendor_page=on_vendor_or_app_page(elements),
+                    viewport=browser_vp,
+                    click_y=gy,
+                ):
                     clicked_download_button = True
 
         # Refined / element clicks are already in native pixels; skip rescaling.
@@ -1064,23 +1398,34 @@ def run_vision_task(
         ):
             ocr_result = None
             if install_task and on_vendor_or_app_page(elements):
-                ocr_result = _click_vendor_download_via_ocr(capture)
+                ocr_result = _click_vendor_download_via_ocr(capture, step=step)
             if ocr_result is not None and ocr_result.ok:
-                last_result, setup_wizard_active, download_click_ts = _after_vendor_download_click(
+                last_result, download_click_ts = _after_vendor_download_click(
                     step=step,
                     detail=ocr_result.detail,
                     label="DOWNLOAD",
                     progress=progress,
                     events=events,
                     history=history,
-                    opened_installers=opened_installers,
-                    stop_event=stop_event,
-                    cancel_event=cancel_event,
                 )
                 history.append(f"step {step}: taskbar miss -> ocr download")
                 session_log(f"vision step {step} taskbar fallback ocr download")
                 last_was_wait = False
                 continue
+            block_name = (element.name if element else target) if action_name == "click" else ""
+            bx, by = (element.cx, element.cy) if element else (0, 0)
+            tier = register_outcome(
+                escalate_state,
+                _action_key_tier("click", escalate_state.tier, bx, by),
+                blocked=True,
+                target_name=block_name,
+            )
+            if tier == "stuck":
+                return VisionRunResult(
+                    False,
+                    step,
+                    "Taskbar mis-clicks exhausted locator tiers, so I stopped.",
+                )
             recent_actions.pop()
             last_result = (
                 "UIA pointed at the taskbar (wrong coords for that button). "
@@ -1113,6 +1458,25 @@ def run_vision_task(
                 last_click_was_download = clicked_download_button
                 if clicked_download_button:
                     progress.note_download_click()
+                    download_click_ts = time.time()
+                    session_log(f"vision step {step} phase -> DOWNLOAD_WAIT (LLM locked)")
+                    last_result, setup_wizard_active, ok = _download_wait_loop(
+                        download_click_ts=download_click_ts,
+                        events=events,
+                        stop_event=stop_event,
+                        cancel_event=cancel_event,
+                        opened_installers=opened_installers,
+                        progress=progress,
+                    )
+                    if ok:
+                        _try_focus_installer(progress, after_download=True)
+                    elif not ok and not last_result:
+                        progress.download_clicked = False
+                        download_click_ts = 0.0
+                        last_result = "Download never appeared — retrying the download button."
+                        session_log("DOWNLOAD_WAIT timeout — reset download_clicked")
+                    last_was_wait = False
+                    continue
                 time.sleep(SETTINGS.post_click_delay)
                 post_cap = capture_primary_monitor()
                 post_elements = get_clickable_elements(
@@ -1142,41 +1506,15 @@ def run_vision_task(
                 else:
                     progress.no_change_clicks = 0
                     progress.off_track_clicks = max(0, progress.off_track_clicks - 1)
-            if clicked_download_button:
-                # We clicked a real Download button. Don't hand control back to
-                # the model to "find the installer" — just wait for the file and
-                # run it ourselves. This is the step the 7B model kept failing.
-                download_click_ts = time.time()
-                opened = _auto_open_download(
-                    download_click_ts,
-                    events,
-                    stop_event,
-                    cancel_event,
-                    opened_installers,
-                )
-                if opened is not None and opened.ok:
-                    setup_wizard_active = True
-                    progress.note_installer_launched()
-                    _try_focus_installer(progress, after_download=True)
-                    last_result = _wizard_open_message(opened.detail)
-                    if "already opened" not in opened.detail:
-                        events.on_action(opened.detail)
-                    history.append(f"step {step}: auto-opened the downloaded installer")
-                    session_log(f"vision step {step}: auto-opened installer")
-                    last_click_was_download = False
-                elif _try_focus_installer(progress, after_download=True):
-                    setup_wizard_active = True
-                    last_result = _wizard_open_message(
-                        "Installer window appeared (browser may have launched it)."
-                    )
-                    history.append(f"step {step}: detected installer window after download")
-                    session_log(f"vision step {step}: detected installer window")
-                else:
-                    last_result = (
-                        "You just clicked the Download button — the file is downloading. "
-                        "Do NOT click Download again and do NOT click the browser's downloads "
-                        "icon. Wait for the installer/setup window to appear, then continue."
-                    )
+                if (
+                    not installer_phase
+                    and click_element is not None
+                    and click_element.kind == "link"
+                ):
+                    wait_for_page_settle(page_sig)
+                    session_log(f"vision step {step} page settled after link click")
+                    last_was_wait = False
+                    continue
         last_was_wait = action_name == "wait"
 
         if not result.ok:

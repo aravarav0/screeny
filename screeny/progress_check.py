@@ -46,6 +46,47 @@ _VENDOR_NAV = re.compile(
     re.I,
 )
 
+DOWNLOAD_RE = re.compile(
+    r"\b(download|free download|get( for windows)?|install now)\b",
+    re.I,
+)
+NAV_VERBS = re.compile(
+    r"\b(play|launch|open|sign[ -]?in|log[ -]?in|buy|support|news|account)\b",
+    re.I,
+)
+HEADER_FRAC = 0.18
+
+
+def is_blocked_vendor_candidate(
+    elem: UIElement,
+    viewport: tuple[int, int, int, int] | None,
+) -> str | None:
+    """Return reason if blocked, else None. Applied before the LLM sees candidates."""
+    if viewport is None:
+        return None
+    left, top, right, bottom = viewport
+    x, y = elem.cx, elem.cy
+    if not (left <= x <= right and top <= y <= bottom):
+        return "outside viewport"
+    vh = max(1, bottom - top)
+    blob = (elem.name or "").lower()
+    if y < top + HEADER_FRAC * vh and not DOWNLOAD_RE.search(blob):
+        return "header band, non-download"
+    if NAV_VERBS.search(blob) and not DOWNLOAD_RE.search(blob):
+        return "nav-verb CTA"
+    return None
+
+
+def filter_vendor_candidates(
+    elements: list[UIElement],
+    viewport: tuple[int, int, int, int] | None,
+) -> list[UIElement]:
+    if viewport is None:
+        return elements
+    return [
+        e for e in elements if is_blocked_vendor_candidate(e, viewport) is None
+    ]
+
 
 @dataclass
 class TaskProgress:
@@ -136,7 +177,13 @@ def is_vendor_header_cta(element: UIElement | None) -> bool:
     """Play Now / sign-in CTAs in the top nav bar — not the hero Download."""
     if element is None or not element.name:
         return False
-    if not _VENDOR_CTA.search(element.name):
+    name = element.name.strip()
+    low = name.lower()
+    if re.search(
+        r"\bplay\b", low
+    ) and not re.search(r"\b(play for free|play free|play now|free to play)\b", low):
+        return element.cy < 400
+    if not _VENDOR_CTA.search(name):
         return False
     return element.cy < 350
 
@@ -158,9 +205,11 @@ def find_vendor_download_target(elements: list[UIElement]) -> UIElement | None:
         if re.fullmatch(r"download\.?", low):
             score = 100.0
         elif low in {"download the game", "download game", "free download"}:
-            score = 85.0
+            score = 25.0
         elif re.search(r"\bdownload\b", low):
             score = 55.0
+            if len(low.split()) > 2:
+                score -= 20.0
             if "windows" in low or "for pc" in low:
                 score += 15.0
         else:
@@ -382,6 +431,12 @@ def click_helps_install_goal(
         return False
     if is_distractor_click(target, element):
         return False
+    if not phase and element and NAV_VERBS.search(element.name or ""):
+        if not DOWNLOAD_RE.search(element.name or ""):
+            return False
+    if not phase and re.search(r"\bplay\s+\w", blob, re.I):
+        if not re.search(r"\b(play for free|play free|play now|free to play)\b", blob, re.I):
+            return False
     # On vendor download pages: hero Download beats header Play Now / platform tiles.
     if elements and element and vendor_download_visible(elements):
         if is_vendor_header_cta(element) or is_platform_tile(element):

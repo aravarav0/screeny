@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -43,7 +44,7 @@ def run_planner(command: str, events: AgentEvents | None = None) -> PlanOutcome:
             ],
             temperature=SETTINGS.planner_temperature,
         )
-    except OllamaError:
+    except (OllamaError, json.JSONDecodeError):
         return PlanOutcome(False, "", command)
 
     summary = str(plan.get("summary", "")).strip()
@@ -180,7 +181,7 @@ def _wants_followthrough(command: str) -> bool:
     return bool(
         re.search(
             r"\b(download|install|set ?up|sign ?in|log ?in|log ?on|play|buy|purchase|"
-            r"checkout|order|fill|click|select|open the|go into|navigate)\b",
+            r"checkout|order|fill|click|select|open the|go into|navigate|message|dm|send|chat)\b",
             text,
         )
     )

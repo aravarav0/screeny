@@ -1,46 +1,86 @@
 # Screeny
 
-Local Jarvis-style agent for Windows. Talk or type a command; Screeny opens apps instantly or uses vision to click around your screen. Everything runs on your machine via **Ollama**.
+Local voice-controlled **Windows desktop agent**. You talk or type a command; Screeny plans the task, opens apps or websites, and uses a vision model to click the UI when needed. Everything runs on your machine through [Ollama](https://ollama.com) — no cloud API keys.
 
-Built for laptops like yours: **RTX GPU with 8GB VRAM**, Ryzen 7, 16–32GB RAM.
+This is the project I am submitting for **GDG SNU AI/ML**.
 
-## What it does
+**Repo:** [https://github.com/aravarav0/screeny](https://github.com/aravarav0/screeny)
 
-- **Fast tools** — "open Spotify", "open YouTube", "open chrome" without burning GPU cycles
-- **Vision loop** — screenshot → Qwen2.5-VL → mouse/keyboard for anything on screen
-- **Whisper `small` model** — better speech recognition (default; first run downloads ~460MB)
-- Type commands in the **text box** if voice mishears you
-- **Voice control** — talk to Screeny; it listens with local Whisper and replies with speech
-- **Text mode** — `screeny --text` if you prefer typing
-- **Safety** — move mouse to the **top-left corner** to abort (pyautogui failsafe)
+## What I planned
+
+I wanted a small “Jarvis” for my own PC:
+
+- Speak a goal in plain English (`install discord`, `open instagram on chrome`)
+- Route simple actions through tools instead of screenshotting every time
+- Use a **vision-language model** only when the screen actually has to be read
+- Keep the whole pipeline **local** on an 8GB VRAM laptop
+- Show progress in a floating overlay so you can see what the agent is doing
+
+## What is actually implemented
+
+| Piece | Status |
+|-------|--------|
+| Voice in (Whisper) + speech out (TTS) | Working |
+| Text commands + floating CustomTkinter overlay | Working |
+| Fast tools (launch app, open URL, Windows search) | Working |
+| Planner LLM (`llama3.2:3b`) that returns structured JSON steps | Working |
+| Vision loop (`qwen2.5vl:7b`) that screenshots and clicks | Working |
+| Windows UI Automation path for native apps | Working |
+| Install flow (search vendor page → download → run installer) | Working, still being hardened |
+| OCR + vendor-page filters so it prefers a real **DOWNLOAD** button | Working |
+| Safety: pyautogui failsafe (mouse to top-left), cancel / stop | Working |
+
+**Stack:** Python 3.11, Ollama, Qwen2.5-VL, Llama 3.2, Whisper, RapidOCR, pyautogui, Windows UIA, CustomTkinter.
+
+### How a command is handled
+
+```
+You (voice or text)
+        │
+        ▼
+   Router  ── known apps / sites / social replies ──► tools (no GPU)
+        │
+        ▼
+   Planner (llama3.2:3b)  → JSON: open URL, search, ask user, or hand off
+        │
+        ▼
+   Vision loop (qwen2.5vl:7b)
+        screenshot → understand screen → click / type / wait
+        OCR + UI Automation as extra grounding
+        ▼
+   Overlay shows plan, actions, errors, install phase
+```
+
+Only one large model is loaded at a time so it fits in ~8GB VRAM.
+
+## What I still want to add
+
+- More reliable vendor-page clicks (installers still miss the wrong CTA sometimes)
+- Global hotkey to expand/collapse the overlay without focusing it
+- Settings panel that actually lists Ollama models and connection state
+- Better Instagram / login-wall handling after a site is opened
+- Tests around routing and the install state machine
+- Optional smaller vision model for faster steps
 
 ## Setup
 
 ### 1. Ollama
 
-Install from [ollama.com](https://ollama.com) if needed, then pull models:
+Install from [ollama.com](https://ollama.com), then:
 
 ```powershell
 ollama pull qwen2.5vl:7b
 ollama pull llama3.2:3b
 ```
 
-Keep Ollama running (it usually starts with Windows). The planner uses a small 3B model; vision uses the 7B model — only one loads at a time (~6GB VRAM).
-
-### 2. Python deps
+### 2. Python
 
 ```powershell
 git clone https://github.com/aravarav0/screeny.git
 cd screeny
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e .
-```
-
-Voice extras:
-
-```powershell
-pip install -e ".[voice]"
+pip install -e ".[voice,pointer]"
 ```
 
 ### 3. Run
@@ -49,61 +89,51 @@ pip install -e ".[voice]"
 screeny
 ```
 
-A small floating widget appears bottom-right. Flip the switch to **activate**, talk when it says **Listening**, and watch it expand when **Speaking**. Flip off to deactivate.
-
 Other modes:
 
 ```powershell
-screeny --no-ui      # terminal voice mode
-screeny --text       # keyboard mode
+screeny --no-ui      # terminal voice
+screeny --text       # type instead of speaking
+screeny open spotify # one-shot text command
 ```
 
-Single command (text only):
-
-```powershell
-screeny open spotify
-```
+Move the mouse to the **top-left corner** to abort a runaway click loop.
 
 ## Examples
 
 | You say | What happens |
 |---------|----------------|
-| `download spotify` | Checks if installed, downloads official installer, runs setup |
-| `install discord if I don't have it` | Same flow for Discord and many other apps |
-| `open youtube and search lofi hip hop` | Opens YouTube search |
-| `open my youtube analytics` | Opens YouTube Studio, then clicks Analytics if needed |
+| `open spotify` | Launches the app if installed |
+| `install discord` | Search → official download page → DOWNLOAD → installer |
+| `open instagram on chrome` | Opens Chrome to Instagram, then vision can continue |
+| `open youtube and search lofi hip hop` | URL + search |
 | `open notepad and type grocery list` | Vision + typing |
 
 ## Config
 
-Copy `.env.example` to `.env` or set environment variables:
+Copy `.env.example` to `.env` if you want to override defaults:
 
 - `VISION_MODEL` — default `qwen2.5vl:7b`
-- `PLANNER_MODEL` — default `llama3.2:3b` (understands intent before acting)
+- `PLANNER_MODEL` — default `llama3.2:3b`
 - `MAX_VISION_STEPS` — default `25`
-- `VOICE_MODE` — default `1` (voice on when extras installed)
-- `TTS_VOICE` — partial name match, e.g. `Zira` or `David`
-- `TTS_RATE` — speech speed, default `175`
-- `WHISPER_MODEL` — default `small` (use `base` for faster/weaker, `medium` for best quality)
-- `MIC_DEVICE_INDEX` — optional mic number if the wrong device is used
+- `WHISPER_MODEL` — default `small`
 
-## How it works
+Installers go to `data/downloads/`. Debug screenshots go to `data/debug/` (gitignored).
+
+## Layout
 
 ```
-You → install flow (check installed → download official installer → run setup)
-    → smart intents (YouTube Studio, Gmail, Google search…)
-    → planner LLM (llama3.2:3b) thinks of URLs / searches / steps
-    → fast tools (launch app, open URL, Windows search fallback)
-    → vision loop only when UI clicks are still needed
+screeny/
+  main.py              entrypoint
+  router.py            intent routing
+  planner.py           LLM planner
+  vision_loop.py       screenshot → act loop
+  ui_grounding.py      click targets from UI / OCR
+  tools.py             launch apps, open URLs
+  ollama_client.py     local model calls
+  ui_app.py            floating overlay
+  ui/                  overlay widgets + theme
 ```
-
-Installers save to `data/downloads/`. Screenshots save to `data/screenshots/`.
-
-## Tips
-
-- Use **tools** for known apps; use **vision** for clicking UI.
-- First vision step may take 10–20s while the model loads into VRAM.
-- If clicks are slightly off, check Windows display scaling (100% works best).
 
 ## License
 
